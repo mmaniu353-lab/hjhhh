@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VPN Gate SSTP 节点检测</title>
+<style>
+  :root {
+    --bg: #0b1120; --panel: #111a2e; --panel2: #16233c; --border: #243450;
+    --text: #dbe7ff; --muted: #7f93b8; --accent: #4cc2ff; --ok: #2fd08a;
+    --res: #b48cff; --dc: #ffb84d; --unk: #8a9bb5;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; min-height: 100vh; padding: 20px; }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  .card .k { color: var(--muted); font-size: 12px; }
+  .card .v { font-size: 24px; font-weight: 700; margin-top: 4px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; align-items: center; }
+  .pill { background: var(--panel2); border: 1px solid var(--border); color: var(--text); border-radius: 999px; padding: 6px 14px; font-size: 13px; cursor: pointer; user-select: none; }
+  .pill.on { border-color: var(--accent); color: var(--accent); }
+  .legend { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  .country { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 14px; overflow: hidden; }
+  .country .head { display: flex; justify-content: space-between; padding: 12px 16px; background: var(--panel2); font-weight: 600; cursor: pointer; flex-wrap: wrap; gap: 6px; }
+  .country .head .tag { font-size: 12px; color: var(--muted); font-weight: 400; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 9px 12px; text-align: left; border-top: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tr:hover td { background: rgba(76,194,255,.05); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11px; }
+  .b-res { background: rgba(180,140,255,.15); color: var(--res); }
+  .b-dc { background: rgba(255,184,77,.15); color: var(--dc); }
+  .b-unk { background: rgba(138,155,181,.15); color: var(--unk); }
+  .lat { color: var(--ok); }
+  code { background: var(--panel2); padding: 2px 6px; border-radius: 5px; font-size: 12px; cursor: pointer; }
+  code:hover { outline: 1px solid var(--accent); }
+  .empty { color: var(--muted); padding: 30px; text-align: center; }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 20px; text-align: center; }
+  @media (max-width: 700px) { th, td { padding: 7px 8px; } .hide-m { display: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>VPN Gate · SSTP 节点检测</h1>
+  <div class="sub">节点来自 VPN Gate（仅 TCP 入口中继），检测由 Cloudflare Worker 执行，GitHub Actions 定时刷新</div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="bar">
+    <span class="pill on" data-f="all">全部</span>
+    <span class="pill" data-f="residential">住宅 IP</span>
+    <span class="pill" data-f="datacenter">数据中心</span>
+    <span class="pill" data-f="unknown">未识别</span>
+  </div>
+  <div class="legend">「住宅 / 数据中心」为基于中继注册类型与出口运营商的估算，非严格判定。</div>
+
+  <div id="countries"></div>
+
+  <div class="footer" id="foot">加载中…</div>
+</div>
+
+<script>
+let DATA = null, FILTER = "all";
+
+function copyLink(text) {
+  if (navigator.clipboard) navigator.clipboard.writeText(text);
+}
+
+function renderCards(d) {
+  const s = d.stats || {};
+  const items = [
+    ["最后更新", d.generated_at || "-", "时区 UTC"],
+    ["SSTP 节点", s.sstp_nodes, "筛选自 VPN Gate"],
+    ["已检测", s.checked, "提交给 Worker"],
+    ["可用节点", s.success, "success = true"],
+    ["国家数量", s.countries, "按可用节点统计"],
+    ["住宅(估算)", s.residential_est, "数据中心 " + (s.datacenter_est || 0)]
+  ];
+  document.getElementById("cards").innerHTML = items.map(function (x) {
+    return '<div class="card"><div class="k">' + x[0] + '</div><div class="v">' + x[1] + '</div><div class="k">' + x[2] + '</div></div>';
+  }).join("");
+}
+
+function rowHtml(n) {
+  let badge;
+  if (n.residential === "residential") badge = '<span class="badge b-res">住宅</span>';
+  else if (n.residential === "datacenter") badge = '<span class="badge b-dc">机房</span>';
+  else badge = '<span class="badge b-unk">未知</span>';
+  const exit = n.exit ? ((n.exit.ip || "?") + " · " + (n.exit.org || n.exit.country || "")) : "-";
+  const date = (n.checked_at || "").split(" ")[0];
+  return '<tr>' +
+    '<td><code title="点击复制 sstp 链接">' + n.host + ':' + n.port + '</code></td>' +
+    '<td class="hide-m">' + (n.country_code || "") + '</td>' +
+    '<td>SSTP</td>' +
+    '<td class="lat">' + (n.latency_ms != null ? n.latency_ms + ' ms' : '-') + '</td>' +
+    '<td class="hide-m" style="color:var(--muted)">' + exit + '</td>' +
+    '<td>' + badge + '</td>' +
+    '<td class="hide-m" style="color:var(--muted)">' + date + '</td>' +
+    '</tr>';
+}
+
+function renderCountries() {
+  const box = document.getElementById("countries");
+  const entries = Object.entries(DATA.countries || {})
+    .map(function (x) {
+      const nodes = x[1].nodes.filter(function (n) { return FILTER === "all" || n.residential === FILTER; });
+      return [x[0], Object.assign({}, x[1], { nodes: nodes, count: nodes.length })];
+    })
+    .filter(function (x) { return x[1].nodes.length > 0; })
+    .sort(function (a, b) { return b[1].count - a[1].count; });
+
+  if (!entries.length) {
+    box.innerHTML = '<div class="country"><div class="empty">没有符合当前筛选的可用节点（本轮 Worker 判定全部不可用或无数据）</div></div>';
+    return;
+  }
+  box.innerHTML = entries.map(function (x) {
+    const name = x[0], g = x[1];
+    return '<div class="country">' +
+      '<div class="head" onclick="this.parentElement.classList.toggle(\'open\')">' +
+        '<span>🌏 ' + name + ' <span class="tag">' + (g.code || "") + '</span></span>' +
+        '<span class="tag">' + g.count + ' 个节点 · 住宅 ' + g.residential + ' · 机房 ' + g.datacenter + '</span>' +
+      '</div>' +
+      '<table><thead><tr><th>Host:Port</th><th class="hide-m">国码</th><th>协议</th><th>延迟</th><th class="hide-m">出口</th><th>类型</th><th class="hide-m">检测日期</th></tr></thead>' +
+      '<tbody>' + g.nodes.map(rowHtml).join("") + '</tbody></table>' +
+    '</div>';
+  }).join("");
+}
+
+function render() {
+  renderCards(DATA);
+  renderCountries();
+  const s = DATA.stats || {};
+  document.getElementById("foot").textContent =
+    "数据时间 " + (DATA.generated_at || "?") + " · 来源 " + (DATA.source || "?") + " · 可用 " + (s.success || 0) + " / 检测 " + (s.checked || 0) + " · 点击 host:port 复制 sstp 链接";
+}
+
+function setFilter(f) {
+  FILTER = f;
+  document.querySelectorAll(".pill").forEach(function (p) { p.classList.toggle("on", p.dataset.f === f); });
+  renderCountries();
+}
+document.querySelectorAll(".pill").forEach(function (p) { p.addEventListener("click", function () { setFilter(p.dataset.f); }); });
+
+// 点击 host:port 复制 sstp://vpn:vpn@host:port
+document.addEventListener("click", function (e) {
+  const code = e.target.closest("code");
+  if (!code) return;
+  const m = code.textContent.match(/(.+):(\d+)$/);
+  if (m) copyLink("sstp://vpn:vpn@" + m[1] + ":" + m[2]);
+});
+
+async function load() {
+  try {
+    const r = await fetch("data.json", { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    DATA = await r.json();
+    render();
+  } catch (err) {
+    document.getElementById("foot").textContent = "data.json 加载失败: " + err + "（等待下一次 Action 生成）";
+  }
+}
+load();
+setInterval(load, 60000);
+</script>
+</body>
+</html>
