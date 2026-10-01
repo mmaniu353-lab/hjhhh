@@ -1,0 +1,4 @@
+# 由 vpngate.py 运行时生成 (data.json + index.html), 不入库
+public/
+__pycache__/
+*.pyc
