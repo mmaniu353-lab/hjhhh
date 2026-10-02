@@ -700,7 +700,7 @@ def build_mihomo_config(data):
         "dns": {"enable": True, "listen": "127.0.0.1:1053", "ipv6": False, "prefer-h3": False,
                 "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16", "respect-rules": True,
                 "default-nameserver": bootstrap, "proxy-server-nameserver": bootstrap,
-                "direct-nameserver": bootstrap, "nameserver": ["https://8.8.4.4/dns-query#住宅出口"],
+                "direct-nameserver": bootstrap, "nameserver": ["tcp://8.8.4.4:53#住宅出口"],
                 "fallback": [], "use-system-hosts": False, "fake-ip-filter": ["*.lan", "*.local", "localhost"]},
         "proxy-providers": {"住宅节点": {"type": "http", "url": SITE_URL + "/proxies.yaml",
                             "path": "./providers/hjhhh-residential.yaml", "interval": 900, "proxy": "DIRECT",

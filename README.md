@@ -16,7 +16,9 @@ GitHub Actions 在每小时的 7、22、37、52 分钟计划运行，GitHub 可�
 
 需要支持当前 Mihomo 配置的客户端，本项目以 Mihomo v1.19.32 验证。导入完整 YAML，使用配置自身的 DNS，关闭“追加系统 DNS”，启用 TUN。FlClash 会用应用设置覆盖配置中的 TUN 开关，仅在 YAML 中写 `enable: true` 并不足以开启应用的 TUN。
 
-网站 DNS 通过所选住宅出口访问 Google DoH，失败后不会回退到直连 DNS。Worker 收到 SSTP 目标域名或 UDP53 查询时，也通过同一个 SSTP 节点解析。节点入口使用自有 Cloudflare 域名的 IPv4，并保留正确的 TLS SNI 与 Host，减少额外入口域名及启动 DNS 依赖。
+网站 DNS 通过所选住宅出口访问 Google TCP DNS，失败后不会回退到直连 DNS。DNS 随 VLESS/TLS 和 SSTP 加密到住宅出口，从出口到 Google 使用 TCP53；减少额外 DoH 握手造成的首次查询超时。Worker 收到 SSTP 目标域名或 UDP53 查询时，也通过同一个 SSTP 节点解析。
+
+入口采用实测通过的两条 Cloudflare IPv4，并保留自有 Worker 域名的 TLS SNI 与 Host。此次本机测试中，两条入口的 Cloudflare colo 为 LAX，原自有域名地址的 colo 为 AMS，优化后的隧道内 TCP DNS 用时约 2.3–3.5 秒。Cloudflare Anycast 路由可能变化，此数据不代表长期速度保证。`EDT_ENTRY_IPS` 可覆盖；不设置时使用自有 Worker 域名解析出的 IPv4。
 
 直连的加密 bootstrap DNS 用于节点入口或订阅下载域名，不承担网站 DNS。阿里 DNS 使用证书名称 `dns.alidns.com` 校验，未关闭证书验证。订阅下载走 DIRECT，因此本机需要能访问 GitHub Pages。
 

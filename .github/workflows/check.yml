@@ -50,6 +50,7 @@ jobs:
           VERIFY_PASSES: "2"
           SITE_URL: "https://mmaniu353-lab.github.io/hjhhh"
           MIHOMO_BINARY: "${{ runner.temp }}/mihomo"
+          EDT_ENTRY_IPS: "104.16.0.1,162.159.192.1"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
