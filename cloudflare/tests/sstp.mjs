@@ -5,6 +5,205 @@ import { fixture, socketMock, loadSection, control, ppp, remoteTcp, encode, paus
 const outgoingData = mock => mock.tcpWrites.filter(item => item.bytes.byteLength);
 const acknowledge = (value, ack, window = 65535, sequence = 1001) => value.mock.push(remoteTcp(value.mock.sourcePort, sequence, 0x10, new Uint8Array(), ack >>> 0, window));
 
+test('target TCP keepalive prevents an eighty-second NAT expiry while PPP remains alive', async () => {
+  const value = await fixture({ manualTimers: true });
+  const reader = value.conn.readable.getReader();
+  try {
+    const first = encode('data:start\n\n'), last = encode('data:finish\n\n');
+    const nextRemoteSequence = 1001 + first.byteLength;
+    value.mock.push(remoteTcp(value.mock.sourcePort, 1001, 0x18, first, value.mock.localSequence));
+    assert.equal(decode((await reader.read()).value), decode(first));
+    let lastTcpActivitySecond = 0, observedWrites = value.mock.tcpWrites.length, expired = false;
+    for (let second = 1; second <= 90; second++) {
+      // SoftEther PPP keepalives remain active even when target TCP is idle.
+      if (second % 5 === 0) value.mock.push(ppp(0xc021, 9, 77, new Uint8Array([1, 2, 3, 4])));
+      await value.runtime.advance(1000);
+      if (value.mock.tcpWrites.length !== observedWrites) {
+        observedWrites = value.mock.tcpWrites.length;
+        lastTcpActivitySecond = second;
+      }
+      if (second - lastTcpActivitySecond >= 80) {
+        expired = true;
+        value.mock.push(remoteTcp(value.mock.sourcePort, nextRemoteSequence, 0x04));
+        await flushTasks();
+        break;
+      }
+    }
+    assert.equal(expired, false, 'link echoes alone must not leave target TCP idle until the NAT sends RST');
+    value.mock.push(remoteTcp(value.mock.sourcePort, nextRemoteSequence, 0x18, last, value.mock.localSequence));
+    assert.equal(decode((await reader.read()).value), decode(last));
+    assert.equal(value.mock.receivedBytes.byteLength, 0, 'keepalive must not add application data');
+  } finally { reader.releaseLock(); value.cleanup(); }
+});
+
+test('an idle TCP probe uses SND.NXT minus one across wrap without consuming sequence space', async () => {
+  const value = await fixture({ manualTimers: true, autoEcho: true, localIsn: 0xffffffff });
+  try {
+    const before = value.mock.tcpWrites.length;
+    await value.runtime.advance(19999);
+    assert.equal(value.mock.tcpWrites.length, before);
+    await value.runtime.advance(1);
+    const probe = value.mock.tcpWrites.at(-1);
+    assert.equal(probe.flags, 0x10);
+    assert.equal(probe.sequence, 0xffffffff);
+    assert.equal(probe.ack, 1001);
+    assert.equal(probe.bytes.byteLength, 0);
+    await value.conn.writable.getWriter().write(encode('next'));
+    assert.equal(outgoingData(value.mock)[0].sequence, 0, 'probe must not consume SND.NXT');
+  } finally { value.cleanup(); }
+});
+
+test('target TCP activity postpones idle probes while PPP activity does not', async () => {
+  const value = await fixture({ manualTimers: true, autoEcho: true, autoAckData: true });
+  try {
+    await value.runtime.advance(15000);
+    await value.conn.writable.getWriter().write(encode('request'));
+    await flushTasks();
+    const before = value.mock.tcpWrites.length;
+    await value.runtime.advance(5000);
+    assert.equal(value.mock.tcpWrites.length, before, 'recent target TX/ACK keeps the TCP flow active');
+    await value.runtime.advance(20000);
+    assert.equal(value.mock.tcpWrites.length, before + 1, 'PPP/SSTP echoes cannot postpone an idle target TCP probe');
+    const afterProbe = value.mock.tcpWrites.length;
+    acknowledge(value, outgoingData(value.mock)[0].sequence + 7);
+    await value.runtime.advance(10000);
+    acknowledge(value, outgoingData(value.mock)[0].sequence + 7);
+    await value.runtime.advance(10000);
+    assert.equal(value.mock.tcpWrites.length, afterProbe, 'recent target RX postpones the next probe');
+  } finally { value.cleanup(); }
+});
+
+test('pending payload and local FIN suppress TCP keepalive probes', async () => {
+  const pending = await fixture({ manualTimers: true, autoEcho: true });
+  try {
+    await pending.conn.writable.getWriter().write(encode('unacknowledged'));
+    const ackCount = pending.mock.tcpWrites.filter(item => item.flags === 0x10).length;
+    await pending.runtime.advance(20000);
+    assert.equal(pending.mock.tcpWrites.filter(item => item.flags === 0x10).length, ackCount);
+    await pending.runtime.advance(3000);
+    assert.equal(pending.runtime.timers.size, 0, 'keepalive cannot mask the real data ACK deadline');
+  } finally { pending.cleanup(); }
+  const finished = await fixture({ manualTimers: true, autoEcho: true });
+  try {
+    await finished.conn.writable.getWriter().close();
+    const before = finished.mock.tcpWrites.length;
+    await finished.runtime.advance(40000);
+    assert.equal(finished.mock.tcpWrites.length, before, 'a local FIN stops TCP keepalive');
+  } finally { finished.cleanup(); }
+});
+
+test('a zero-payload peer keepalive is ACKed across wrap without delivering or consuming bytes', async () => {
+  const value = await fixture({ manualTimers: true, localIsn: 0xffffffff, remoteIsn: 0xfffffffe });
+  try {
+    const before = value.mock.tcpWrites.length;
+    value.mock.push(remoteTcp(value.mock.sourcePort, 0xfffffffe, 0x10, new Uint8Array(), 0));
+    await flushTasks();
+    assert.equal(value.mock.tcpWrites.length, before + 1);
+    const response = value.mock.tcpWrites.at(-1);
+    assert.equal(response.sequence, 0);
+    assert.equal(response.ack, 0xffffffff);
+    assert.equal(response.flags, 0x10);
+    assert.equal(response.bytes.byteLength, 0);
+    await value.conn.writable.getWriter().write(encode('next'));
+    assert.equal(outgoingData(value.mock)[0].sequence, 0);
+    value.mock.push(remoteTcp(value.mock.sourcePort, 0xffffffff, 0x18, encode('reply'), 4));
+    const reader = value.conn.readable.getReader();
+    assert.equal(decode((await reader.read()).value), 'reply');
+    reader.releaseLock();
+  } finally { value.cleanup(); }
+});
+
+test('ordinary pure ACKs do not cause ACK loops or advance unacknowledged data', async () => {
+  const value = await fixture({ manualTimers: true, peerWindow: 6 });
+  try {
+    await value.conn.writable.getWriter().write(encode('abcdef'));
+    const before = value.mock.tcpWrites.length, base = outgoingData(value.mock)[0].sequence;
+    acknowledge(value, base);
+    acknowledge(value, base + 6, 6, 1000); // Keepalive sequence is outside the receive window.
+    await flushTasks();
+    assert.equal(value.mock.tcpWrites.length, before + 1, 'reply only to the keepalive, not ordinary ACK');
+    await value.runtime.advance(1000);
+    assert.equal(outgoingData(value.mock).length, 2, 'out-of-window keepalive ACK cannot acknowledge application data');
+  } finally { value.cleanup(); }
+});
+
+test('SoftEther user-mode keepalive with current receive sequence and previous ACK gets a reply', async () => {
+  const value = await fixture({ manualTimers: true, autoEcho: true, localIsn: 0xffffffff });
+  try {
+    const before = value.mock.tcpWrites.length;
+    for (let tick = 0; tick < 4; tick++) {
+      await value.runtime.advance(5000);
+      acknowledge(value, 0xffffffff);
+      await flushTasks();
+    }
+    const responses = value.mock.tcpWrites.slice(before);
+    assert.equal(responses.length, 4, 'user-mode TCP probes must refresh the NAT even while suppressing idle probes');
+    assert.ok(responses.every(item => item.flags === 0x10 && item.sequence === 0 && item.ack === 1001 && item.bytes.byteLength === 0));
+    await value.conn.writable.getWriter().write(encode('next'));
+    assert.equal(outgoingData(value.mock)[0].sequence, 0);
+  } finally { value.cleanup(); }
+});
+
+test('SoftEther previous-ACK keepalive cannot acknowledge pending data or shrink its send window', async () => {
+  const value = await fixture({ manualTimers: true, peerWindow: 6 });
+  try {
+    await value.conn.writable.getWriter().write(encode('abcdef'));
+    const before = value.mock.tcpWrites.length, base = outgoingData(value.mock)[0].sequence;
+    acknowledge(value, base - 1, 0);
+    await flushTasks();
+    assert.equal(value.mock.tcpWrites.length, before + 1, 'reply to the user-mode probe');
+    await value.runtime.advance(1000);
+    assert.deepEqual(outgoingData(value.mock).map(item => [item.sequence, item.payload]), [[base, 'abcdef'], [base, 'abcdef']]);
+  } finally { value.cleanup(); }
+});
+
+test('native asynchronous TCP keepalive stops after external close', { timeout: 2000 }, async () => {
+  const value = await fixture({ autoEcho: true, localIsn: 0xffffffff });
+  try {
+    const before = value.mock.tcpWrites.length;
+    for (let attempt = 0; attempt < 30 && value.mock.tcpWrites.length === before; attempt++) await pause(20);
+    assert.ok(value.mock.tcpWrites.length > before, 'native timer must send a TCP keepalive');
+    const probe = value.mock.tcpWrites.at(-1);
+    assert.equal(probe.flags, 0x10);
+    assert.equal(probe.sequence, 0xffffffff);
+    assert.equal(probe.bytes.byteLength, 0);
+    value.conn.close();
+    await flushTasks();
+    const closedWrites = value.mock.tcpWrites.length;
+    await pause(220);
+    assert.equal(value.mock.tcpWrites.length, closedWrites);
+    assert.equal(value.runtime.timers.size, 0);
+  } finally { value.cleanup(); }
+});
+
+test('TCP keepalive write failure closes both streams and clears deadlines', async () => {
+  const runtime = loadSection({ manualTimers: true }), mock = socketMock({ autoEcho: true });
+  const originalGetWriter = mock.socket.writable.getWriter.bind(mock.socket.writable);
+  let failKeepalive = false;
+  mock.socket.writable = { getWriter() {
+    const writer = originalGetWriter();
+    return {
+      write(frame) {
+        if (failKeepalive && frame.byteLength === 48 && frame[6] === 0 && frame[7] === 33 && frame[41] === 0x10) return Promise.reject(new Error('mock TCP keepalive write failed'));
+        return writer.write(frame);
+      },
+      close: () => writer.close(), releaseLock: () => writer.releaseLock()
+    };
+  } };
+  const conn = await runtime.connect({ hostname: 'mock.invalid', port: 443, username: 'vpn', password: 'vpn' }, '203.0.113.1', 443, () => mock.socket);
+  try {
+    const closedFailed = conn.closed.then(() => null, error => error);
+    const readFailed = conn.readable.getReader().read().then(() => null, error => error);
+    failKeepalive = true;
+    await runtime.advance(20000);
+    assert.match((await closedFailed)?.message || '', /keepalive write failed/);
+    assert.match((await readFailed)?.message || '', /keepalive write failed/);
+    await assert.rejects(conn.writable.getWriter().write(encode('later')), /keepalive write failed/);
+    assert.equal(runtime.timers.size, 0);
+    assert.equal(mock.metrics.activeReads, 0);
+  } finally { conn.close(); runtime.cleanup(); }
+});
+
 test('a dropped outgoing segment is retransmitted with its original sequence after one second', async () => {
   const value = await fixture({ manualTimers: true, autoAckData: true, dropDataSegments: [1] });
   try {

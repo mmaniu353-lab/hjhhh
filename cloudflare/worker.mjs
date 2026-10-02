@@ -4915,6 +4915,7 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 		// bounded window, including when the 32-bit TCP sequence wraps.
 		let sendAcknowledged = sequenceNumber, pendingSegments = [], pendingSendBytes = 0;
 		let retryTimer = null, echoTimer = null, retryRunning = false, retryCount = 0, retryInterval = 1000, sendProgress = 0;
+		let lastTcpActivityAt = Date.now();
 		const sendWaiters = new Set();
 		const wakeSenders = () => {
 			for (const resolve of sendWaiters) resolve();
@@ -4952,7 +4953,10 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 						if (available <= 0) break;
 						frames.push(buildTcpFrame(0x18, segment.payload.subarray(0, available), segment.sequence));
 					}
-					if (frames.length) await writeLinkPacket(拼接字节数据(...frames), 'SSTP TCP data retry write timed out');
+					if (frames.length) {
+						await writeLinkPacket(拼接字节数据(...frames), 'SSTP TCP data retry write timed out');
+						lastTcpActivityAt = Date.now();
+					}
 					if (progress === sendProgress) retryInterval = Math.min(retryInterval * 2, 8000);
 				} catch (error) { close(error) }
 				finally { retryRunning = false; armDataRetry() }
@@ -5002,7 +5006,16 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 			echoTimer = setTimeout(async () => {
 				echoTimer = null;
 				if (closing) return;
-				try { await writeLinkPacket(buildLinkControlPacket(0x0008)); armLinkEcho() }
+				try {
+					await writeLinkPacket(buildLinkControlPacket(0x0008));
+					// Link echoes do not refresh the target TCP's NAT session. Probe
+					// only an idle flow, without consuming sequence or application bytes.
+					if (!closing && !localFinSent && !pendingSegments.length && Date.now() - lastTcpActivityAt >= SSTP_LINK_ECHO_INTERVAL_MS) {
+						await writeLinkPacket(buildTcpFrame(0x10, SSTP_EMPTY_BYTES, (sequenceNumber - 1) >>> 0), 'SSTP TCP keepalive write timed out');
+						lastTcpActivityAt = Date.now();
+					}
+					armLinkEcho();
+				}
 				catch (error) { close(error) }
 			}, SSTP_LINK_ECHO_INTERVAL_MS);
 		};
@@ -5077,6 +5090,7 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 					if (!ppp || ppp.protocol !== 0x0021) continue;
 					const incoming = matchIncomingIpPacket(ppp.ipPacket);
 					if (!incoming) continue;
+					lastTcpActivityAt = Date.now();
 					if (incoming.flags & 0x04) {
 						if (incoming.sequence === acknowledgementNumber) throw new Error('TCP peer reset the connection through SSTP');
 						await writeLinkPacket(buildTcpFrame(0x10));
@@ -5104,7 +5118,11 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 					}
 
 					if (bufferedBytes.byteLength < 4 || pendingLength >= 32768) flush();
-					if (payload.byteLength || (incoming.flags & 0x01)) await writeLinkPacket(buildTcpFrame(0x10));
+					const receiveDistance = sequenceDistance(incoming.sequence);
+					// SoftEther user-mode NAT also probes with current SEQ and the
+					// previous ACK. Reply without accepting that stale cumulative ACK.
+					const isKeepalive = !payload.byteLength && (incoming.flags & 0x17) === 0x10 && (receiveDistance === -1 || (receiveDistance === 0 && incoming.acknowledgement === ((sendAcknowledged - 1) >>> 0)));
+					if (payload.byteLength || (incoming.flags & 0x01) || isKeepalive) await writeLinkPacket(buildTcpFrame(0x10));
 				}
 			} catch (error) { close(error) }
 		})();
@@ -5140,6 +5158,7 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 							available -= length;
 						}
 						await writeLinkPacket(拼接字节数据(...frames), 'SSTP TCP data write timed out');
+						lastTcpActivityAt = Date.now();
 						armDataRetry();
 					}
 				} catch (error) { close(error); throw error }

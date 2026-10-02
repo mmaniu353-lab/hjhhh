@@ -421,7 +421,7 @@
  			if (payloadLength) frame.set(bytes, 48);
  			tcpPseudoHeader[10] = tcpLength >> 8;
  			tcpPseudoHeader[11] = tcpLength & 0xff;
-@@ -4616,37 +4842,178 @@
+@@ -4616,37 +4842,191 @@
  			return frame;
  		};
  		const matchIncomingIpPacket = ipPacket => {
@@ -508,6 +508,7 @@
 +		// bounded window, including when the 32-bit TCP sequence wraps.
 +		let sendAcknowledged = sequenceNumber, pendingSegments = [], pendingSendBytes = 0;
 +		let retryTimer = null, echoTimer = null, retryRunning = false, retryCount = 0, retryInterval = 1000, sendProgress = 0;
++		let lastTcpActivityAt = Date.now();
 +		const sendWaiters = new Set();
 +		const wakeSenders = () => {
 +			for (const resolve of sendWaiters) resolve();
@@ -545,7 +546,10 @@
 +						if (available <= 0) break;
 +						frames.push(buildTcpFrame(0x18, segment.payload.subarray(0, available), segment.sequence));
 +					}
-+					if (frames.length) await writeLinkPacket(拼接字节数据(...frames), 'SSTP TCP data retry write timed out');
++					if (frames.length) {
++						await writeLinkPacket(拼接字节数据(...frames), 'SSTP TCP data retry write timed out');
++						lastTcpActivityAt = Date.now();
++					}
 +					if (progress === sendProgress) retryInterval = Math.min(retryInterval * 2, 8000);
 +				} catch (error) { close(error) }
 +				finally { retryRunning = false; armDataRetry() }
@@ -595,7 +599,16 @@
 +			echoTimer = setTimeout(async () => {
 +				echoTimer = null;
 +				if (closing) return;
-+				try { await writeLinkPacket(buildLinkControlPacket(0x0008)); armLinkEcho() }
++				try {
++					await writeLinkPacket(buildLinkControlPacket(0x0008));
++					// Link echoes do not refresh the target TCP's NAT session. Probe
++					// only an idle flow, without consuming sequence or application bytes.
++					if (!closing && !localFinSent && !pendingSegments.length && Date.now() - lastTcpActivityAt >= SSTP_LINK_ECHO_INTERVAL_MS) {
++						await writeLinkPacket(buildTcpFrame(0x10, SSTP_EMPTY_BYTES, (sequenceNumber - 1) >>> 0), 'SSTP TCP keepalive write timed out');
++						lastTcpActivityAt = Date.now();
++					}
++					armLinkEcho();
++				}
 +				catch (error) { close(error) }
 +			}, SSTP_LINK_ECHO_INTERVAL_MS);
 +		};
@@ -610,7 +623,7 @@
  		const readable = new ReadableStream({
  			start(controller) {
  				streamController = controller;
-@@ -4659,36 +5026,75 @@
+@@ -4659,36 +5039,76 @@
  		(async () => {
  			try {
  				let pendingChunks = [], pendingLength = 0;
@@ -675,6 +688,7 @@
 -							pendingChunks.push(new Uint8Array(payload));
 -							pendingLength += payload.byteLength;
 -						}
++					lastTcpActivityAt = Date.now();
 +					if (incoming.flags & 0x04) {
 +						if (incoming.sequence === acknowledgementNumber) throw new Error('TCP peer reset the connection through SSTP');
 +						await writeLinkPacket(buildTcpFrame(0x10));
@@ -698,11 +712,15 @@
  						const controller = streamController;
  						if (controller) {
  							try { controller.close() } catch (e) { }
-@@ -4698,40 +5104,54 @@
+@@ -4698,40 +5118,59 @@
  					}
  
  					if (bufferedBytes.byteLength < 4 || pendingLength >= 32768) flush();
-+					if (payload.byteLength || (incoming.flags & 0x01)) await writeLinkPacket(buildTcpFrame(0x10));
++					const receiveDistance = sequenceDistance(incoming.sequence);
++					// SoftEther user-mode NAT also probes with current SEQ and the
++					// previous ACK. Reply without accepting that stale cumulative ACK.
++					const isKeepalive = !payload.byteLength && (incoming.flags & 0x17) === 0x10 && (receiveDistance === -1 || (receiveDistance === 0 && incoming.acknowledgement === ((sendAcknowledged - 1) >>> 0)));
++					if (payload.byteLength || (incoming.flags & 0x01) || isKeepalive) await writeLinkPacket(buildTcpFrame(0x10));
  				}
 -			} catch (error) {
 -				const controller = streamController;
@@ -760,6 +778,7 @@
 +							available -= length;
 +						}
 +						await writeLinkPacket(拼接字节数据(...frames), 'SSTP TCP data write timed out');
++						lastTcpActivityAt = Date.now();
 +						armDataRetry();
 +					}
 +				} catch (error) { close(error); throw error }
@@ -779,7 +798,7 @@
  			}
  		});
  
-@@ -4816,6 +5236,57 @@
+@@ -4816,6 +5255,57 @@
  
  function log(...args) {
  	if (调试日志打印) console.log(...args);
