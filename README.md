@@ -6,7 +6,7 @@
 
 ## 检测与自动切换
 
-GitHub Actions 在每小时的 7、22、37、52 分钟计划运行，GitHub 可能延迟任务。每个节点必须连续两次通过自有检查器，返回有效且一致的公共出口 IP，再通过实际 VLESS → Worker → SSTP 链路访问 Google 的 HTTPS 204 页面和 Cloudflare 的 HTTPS 页面。HTTPS 证书验证保持开启，HTTP 状态不符、TLS EOF、超时均剔除。这个检测使用 HTTPS HEAD；正文下载和持续连接还需要实际访问验证。
+GitHub Actions 在每小时的 7、22、37、52 分钟计划运行，GitHub 可能延迟任务。每个节点必须连续两次通过自有检查器，返回有效且一致的公共出口 IP，再通过实际 VLESS → Worker → SSTP 链路访问 Google 和 Cloudflare 的 HTTPS 204 页面。HTTPS 证书验证保持开启，HTTP 状态不符、TLS EOF、超时均剔除。这个检测使用 HTTPS HEAD；Cloudflare trace 仅用于另外的 GET 出口验证，不能用作 HEAD 200 检测。
 
 自动订阅每 15 分钟更新节点集合，每 3 分钟做 HTTPS 健康检查，在同国家组内故障切换。选择“住宅出口 → 日本住宅自动”等国家组后，避免跨国家轮换影响登录会话。切换节点仍然会改变出口 IP。全部住宅节点失败时，任务失败并保留上次已部署版本。
 

@@ -13,7 +13,7 @@ import requests
 import yaml
 
 HTTPS_CASES = [('https://www.gstatic.com/generate_204', '204'),
-               ('https://www.cloudflare.com/cdn-cgi/trace', '200')]
+               ('https://cp.cloudflare.com/generate_204', '204')]
 
 
 def check_https_node(node, session, api_url, timeout_ms=15000):
