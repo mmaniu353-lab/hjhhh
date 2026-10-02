@@ -313,6 +313,9 @@ export default {
 					]);
 					const 订阅转换后端请求订阅 = 请求TOKEN === 今日订阅转换后端专属TOKEN || 请求TOKEN === 昨日订阅转换后端专属TOKEN;
 					if (用户客户端请求订阅 || 订阅转换后端请求订阅 || 作为优选订阅生成器) {
+						if (isResidentialSubscription(host, 用户客户端请求订阅, url, UA, request.headers)) {
+							return getResidentialSubscription({ "Profile-web-page-url": url.origin + '/admin' });
+						}
 						config_JSON = await 读取config_JSON(env, host, userID, UA);
 						if (作为优选订阅生成器) ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_Best_SUB', config_JSON, false));
 						else ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_SUB', config_JSON));
@@ -5098,6 +5101,57 @@ function 获取传输路径参数值(配置 = {}, 节点路径 = '/', 作为优�
 
 function log(...args) {
 	if (调试日志打印) console.log(...args);
+}
+
+const RESIDENTIAL_CONFIG_URL = 'https://mmaniu353-lab.github.io/hjhhh/mihomo.yaml';
+
+function isResidentialSubscription(host, authenticatedUser, url, userAgent, headers) {
+	if (!authenticatedUser || host !== 'fgfg.opopoiovcc.kdns.fr') return false;
+	const ua = userAgent.toLowerCase();
+	if (url.searchParams.has('sub') || url.searchParams.has('b64') || url.searchParams.has('base64') ||
+		headers.has('subconverter-request') || headers.has('subconverter-version') ||
+		ua.includes('subconverter') || ua.includes('cf-workers-sub')) return false;
+	if (url.searchParams.has('target')) return url.searchParams.get('target') === 'clash';
+	return url.searchParams.has('clash') || ua.includes('clash') || ua.includes('meta') || ua.includes('mihomo');
+}
+
+async function getResidentialSubscription(headers = {}, fetcher = fetch) {
+	const controller = new AbortController();
+	let timer;
+	const deadline = new Promise((_, reject) => {
+		timer = setTimeout(() => {
+			controller.abort();
+			reject(new Error('Residential subscription deadline exceeded'));
+		}, 15000);
+	});
+	try {
+		const profile = await Promise.race([(async () => {
+			const response = await fetcher(RESIDENTIAL_CONFIG_URL, {
+				signal: controller.signal, redirect: 'manual', cf: { cacheTtl: 60, cacheEverything: true }
+			});
+			if (!response.ok) throw new Error('Residential subscription upstream status ' + response.status);
+			const content = await response.text();
+			if (new TextEncoder().encode(content).byteLength > 65536 ||
+				!/^mixed-port:\s*\d+\s*$/m.test(content) || !/^dns:\s*$/m.test(content) ||
+				!content.includes('strict-route: true') || !content.includes('tcp://8.8.4.4:53#住宅出口') ||
+				!content.includes('https://mmaniu353-lab.github.io/hjhhh/proxies.yaml')) {
+				throw new Error('Residential subscription upstream returned an invalid profile');
+			}
+			return content;
+		})(), deadline]);
+		return new Response(profile, { headers: {
+			...headers, 'Content-Type': 'application/x-yaml; charset=utf-8', 'Cache-Control': 'no-store',
+			'Profile-Update-Interval': '1',
+			'Content-Disposition': "attachment; filename*=utf-8''" + encodeURIComponent('住宅 IP · DNS 修复')
+		} });
+	} catch {
+		controller.abort();
+		return new Response('住宅订阅暂时不可用，请稍后更新并保留现有配置。', {
+			status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'Retry-After': '60' }
+		});
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 function Clash订阅配置文件热补丁(Clash_原始订阅内容, config_JSON = {}) {

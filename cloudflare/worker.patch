@@ -1,6 +1,16 @@
---- worker.js
-+++ worker.js
-@@ -710,7 +710,7 @@
+--- a/worker.js
++++ b/worker.js
+@@ -313,6 +313,9 @@
+ 					]);
+ 					const 订阅转换后端请求订阅 = 请求TOKEN === 今日订阅转换后端专属TOKEN || 请求TOKEN === 昨日订阅转换后端专属TOKEN;
+ 					if (用户客户端请求订阅 || 订阅转换后端请求订阅 || 作为优选订阅生成器) {
++						if (isResidentialSubscription(host, 用户客户端请求订阅, url, UA, request.headers)) {
++							return getResidentialSubscription({ "Profile-web-page-url": url.origin + '/admin' });
++						}
+ 						config_JSON = await 读取config_JSON(env, host, userID, UA);
+ 						if (作为优选订阅生成器) ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_Best_SUB', config_JSON, false));
+ 						else ctx.waitUntil(请求日志记录(env, request, 访问IP, 'Get_SUB', config_JSON));
+@@ -710,7 +713,7 @@
  }
  
  function 处理叉HTTPUDP请求(首包, reader, request, 反代上下文, responseHeaders) {
@@ -9,7 +19,7 @@
  	return new Response(new ReadableStream({
  		async start(controller) {
  			let 已关闭 = false;
-@@ -749,7 +749,7 @@
+@@ -749,7 +752,7 @@
  				}
  				if (!(首包.协议 === 'trojan' && 木马UDP上下文.反代地址) && 首包.rawData?.byteLength) {
  					if (首包.协议 === 'trojan') await 转发木马UDP数据(首包.rawData, 叉桥, 木马UDP上下文, request);
@@ -18,7 +28,7 @@
  					udpRespHeader = null;
  				}
  				while (true) {
-@@ -757,7 +757,7 @@
+@@ -757,7 +760,7 @@
  					if (done) break;
  					if (!value || value.byteLength === 0) continue;
  					if (首包.协议 === 'trojan') await 转发木马UDP数据(value, 叉桥, 木马UDP上下文, request);
@@ -27,7 +37,7 @@
  					udpRespHeader = null;
  				}
  			} catch (err) {
-@@ -983,7 +983,7 @@
+@@ -983,7 +986,7 @@
  	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, downlinkDrain: Promise.resolve() };
  	const 失效远端连接 = () => 失效TCP连接世代(remoteConnWrapper);
  	let isDnsQuery = false;
@@ -36,7 +46,7 @@
  	let 判断是否是木马 = null;
  	let 当前写入Socket = null;
  	let 远端写入器 = null;
-@@ -1168,7 +1168,7 @@
+@@ -1168,7 +1171,7 @@
  						if (!payload.byteLength) continue;
  						if (isDnsQuery) {
  							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
@@ -45,7 +55,7 @@
  							continue;
  						}
  						if (remoteConnWrapper.socket || remoteConnWrapper.connectingPromise) {
-@@ -1213,7 +1213,7 @@
+@@ -1213,7 +1216,7 @@
  								const rawData = rawClientData;
  								if (isDnsQuery) {
  									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
@@ -54,7 +64,7 @@
  								}
  								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文);
  							}
-@@ -1298,7 +1298,7 @@
+@@ -1298,7 +1301,7 @@
  	const 失效远端连接 = () => 失效TCP连接世代(remoteConnWrapper);
  	let isDnsQuery = false;
  	let 判断是否是木马 = null;
@@ -63,7 +73,7 @@
  	const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
  	const SS模式禁用EarlyData = !!url.searchParams.get('enc');
  	let WS上行写入队列 = null;
-@@ -1637,7 +1637,7 @@
+@@ -1637,7 +1640,7 @@
  		let 当前块字节 = null;
  		if (isDnsQuery) {
  			if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request);
@@ -72,7 +82,7 @@
  		}
  		if (判断协议类型 === 'ss') {
  			await 处理SS数据(chunk);
-@@ -1701,7 +1701,7 @@
+@@ -1701,7 +1704,7 @@
  			const rawData = rawClientData;
  			if (isDnsQuery) {
  				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
@@ -81,7 +91,7 @@
  			}
  			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 反代上下文);
  		}
-@@ -2107,7 +2107,7 @@
+@@ -2107,7 +2110,7 @@
  			}
  			dns响应上下文.缓存 = 响应输入.slice(responseCursor);
  			return 响应帧列表.length ? 响应帧列表 : new Uint8Array(0);
@@ -90,7 +100,7 @@
  	}
  
  	if (上下文) 上下文.缓存 = input.slice(cursor);
-@@ -2465,7 +2465,8 @@
+@@ -2465,7 +2468,8 @@
  	}
  }
  
@@ -100,7 +110,7 @@
  	const 请求数据 = 数据转Uint8Array(udpChunk);
  	const 请求字节数 = 请求数据.byteLength;
  	log(`[UDP转发] 收到 DNS 请求: ${请求字节数}B -> 8.8.4.4:53`);
-@@ -4308,7 +4309,169 @@
+@@ -4308,7 +4312,169 @@
  	}
  }
  //////////////////////////////////////////////////sstpConnect///////////////////////////////////////////////
@@ -270,7 +280,7 @@
  const SSTP_EMPTY_BYTES = new Uint8Array(0);
  
  function readSstpUint16(bytes, offset = 0) {
-@@ -4334,7 +4497,7 @@
+@@ -4334,7 +4500,7 @@
  async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
  	proxy = { ...proxy, username: proxy.username ?? null, password: proxy.password ?? null };
  	let bufferedBytes = SSTP_EMPTY_BYTES, pppIdentifier = 1, socket = null, reader = null, writer = null;
@@ -279,7 +289,7 @@
  	const closed = new Promise((resolve, reject) => {
  		resolveClosed = resolve;
  		rejectClosed = reject;
-@@ -4345,11 +4508,13 @@
+@@ -4345,11 +4511,13 @@
  		settle(value);
  	};
  	const close = () => {
@@ -294,7 +304,7 @@
  		settleClosed(resolveClosed);
  	};
  
-@@ -4429,6 +4594,40 @@
+@@ -4429,6 +4597,40 @@
  			offset += length;
  		}
  		return options;
@@ -335,7 +345,7 @@
  	};
  
  	try {
-@@ -4507,7 +4706,7 @@
+@@ -4507,7 +4709,7 @@
  
  		for (let round = 0; round < 50 && !ipcpFinished; round++) {
  			const packet = await readPacket(CONNECT_TIMEOUT_MS);
@@ -344,7 +354,7 @@
  			const ppp = parsePPPFrame(packet.body);
  			if (!ppp) continue;
  
-@@ -4569,7 +4768,7 @@
+@@ -4569,7 +4771,7 @@
  		/** @type {string | null} */
  		let targetIp = isIPv4(target) ? target : null;
  		if (!targetIp) {
@@ -353,7 +363,7 @@
  			const recordData = records.find(item => item.type === 1 && isIPv4(item.data))?.data;
  			targetIp = typeof recordData === 'string' ? recordData : null;
  		}
-@@ -4607,7 +4806,7 @@
+@@ -4607,7 +4809,7 @@
  			view.setUint32(36, acknowledgementNumber);
  			frame[40] = 0x50;
  			frame[41] = flags;
@@ -362,7 +372,7 @@
  			if (payloadLength) frame.set(bytes, 48);
  			tcpPseudoHeader[10] = tcpLength >> 8;
  			tcpPseudoHeader[11] = tcpLength & 0xff;
-@@ -4616,34 +4815,78 @@
+@@ -4616,34 +4818,78 @@
  			return frame;
  		};
  		const matchIncomingIpPacket = ipPacket => {
@@ -448,7 +458,7 @@
  
  		/** @type {ReadableStreamDefaultController<Uint8Array> | null} */
  		let streamController = null;
-@@ -4659,36 +4902,74 @@
+@@ -4659,36 +4905,74 @@
  		(async () => {
  			try {
  				let pendingChunks = [], pendingLength = 0;
@@ -535,7 +545,7 @@
  						const controller = streamController;
  						if (controller) {
  							try { controller.close() } catch (e) { }
-@@ -4698,6 +4979,7 @@
+@@ -4698,6 +4982,7 @@
  					}
  
  					if (bufferedBytes.byteLength < 4 || pendingLength >= 32768) flush();
@@ -543,7 +553,7 @@
  				}
  			} catch (error) {
  				const controller = streamController;
-@@ -4705,7 +4987,7 @@
+@@ -4705,7 +4990,7 @@
  					try { controller.error(error) } catch (e) { }
  				}
  				settleClosed(rejectClosed, error);
@@ -552,7 +562,7 @@
  			}
  		})();
  
-@@ -4727,11 +5009,11 @@
+@@ -4727,11 +5012,11 @@
  				await writer.write(拼接字节数据(...frames));
  			},
  			close() {
@@ -566,3 +576,61 @@
  			}
  		});
  
+@@ -4816,6 +5101,57 @@
+ 
+ function log(...args) {
+ 	if (调试日志打印) console.log(...args);
++}
++
++const RESIDENTIAL_CONFIG_URL = 'https://mmaniu353-lab.github.io/hjhhh/mihomo.yaml';
++
++function isResidentialSubscription(host, authenticatedUser, url, userAgent, headers) {
++	if (!authenticatedUser || host !== 'fgfg.opopoiovcc.kdns.fr') return false;
++	const ua = userAgent.toLowerCase();
++	if (url.searchParams.has('sub') || url.searchParams.has('b64') || url.searchParams.has('base64') ||
++		headers.has('subconverter-request') || headers.has('subconverter-version') ||
++		ua.includes('subconverter') || ua.includes('cf-workers-sub')) return false;
++	if (url.searchParams.has('target')) return url.searchParams.get('target') === 'clash';
++	return url.searchParams.has('clash') || ua.includes('clash') || ua.includes('meta') || ua.includes('mihomo');
++}
++
++async function getResidentialSubscription(headers = {}, fetcher = fetch) {
++	const controller = new AbortController();
++	let timer;
++	const deadline = new Promise((_, reject) => {
++		timer = setTimeout(() => {
++			controller.abort();
++			reject(new Error('Residential subscription deadline exceeded'));
++		}, 15000);
++	});
++	try {
++		const profile = await Promise.race([(async () => {
++			const response = await fetcher(RESIDENTIAL_CONFIG_URL, {
++				signal: controller.signal, redirect: 'manual', cf: { cacheTtl: 60, cacheEverything: true }
++			});
++			if (!response.ok) throw new Error('Residential subscription upstream status ' + response.status);
++			const content = await response.text();
++			if (new TextEncoder().encode(content).byteLength > 65536 ||
++				!/^mixed-port:\s*\d+\s*$/m.test(content) || !/^dns:\s*$/m.test(content) ||
++				!content.includes('strict-route: true') || !content.includes('tcp://8.8.4.4:53#住宅出口') ||
++				!content.includes('https://mmaniu353-lab.github.io/hjhhh/proxies.yaml')) {
++				throw new Error('Residential subscription upstream returned an invalid profile');
++			}
++			return content;
++		})(), deadline]);
++		return new Response(profile, { headers: {
++			...headers, 'Content-Type': 'application/x-yaml; charset=utf-8', 'Cache-Control': 'no-store',
++			'Profile-Update-Interval': '1',
++			'Content-Disposition': "attachment; filename*=utf-8''" + encodeURIComponent('住宅 IP · DNS 修复')
++		} });
++	} catch {
++		controller.abort();
++		return new Response('住宅订阅暂时不可用，请稍后更新并保留现有配置。', {
++			status: 503, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'Retry-After': '60' }
++		});
++	} finally {
++		clearTimeout(timer);
++	}
+ }
+ 
+ function Clash订阅配置文件热补丁(Clash_原始订阅内容, config_JSON = {}) {

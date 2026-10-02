@@ -37,6 +37,7 @@ jobs:
           node --check cloudflare/worker.mjs
           node cloudflare/tests/dns.cjs cloudflare/worker.mjs
           node cloudflare/tests/run.mjs
+          node cloudflare/tests/subscription.cjs
 
       - name: Download pinned official Mihomo for real HTTPS verification
         run: python download_mihomo.py --output "${RUNNER_TEMP}/mihomo"

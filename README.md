@@ -4,6 +4,8 @@
 
 客户端订阅：[mihomo.yaml](https://mmaniu353-lab.github.io/hjhhh/mihomo.yaml)。节点集合：[proxies.yaml](https://mmaniu353-lab.github.io/hjhhh/proxies.yaml)。
 
+原 Worker 的 `/sub?token=自己的订阅令牌` 地址也支持修复后的完整配置：FlClash/Mihomo/Clash 的请求直接返回上述 YAML，浏览器下载时添加 `&target=clash`。沿用原来的令牌鉴权；令牌不会发送给 GitHub，也不要提交到仓库。修复配置不可用时返回 503，客户端保留现有配置，不回退到旧的 DNS 模板。订阅响应的更新提示为 1 小时，配置内的节点集合仍每 15 分钟更新。
+
 ## 检测与自动切换
 
 GitHub Actions 在每小时的 7、22、37、52 分钟计划运行，GitHub 可能延迟任务。每个节点必须连续两次通过自有检查器，返回有效且一致的公共出口 IP，再通过实际 VLESS → Worker → SSTP 链路访问 Google 和 Cloudflare 的 HTTPS 204 页面。HTTPS 证书验证保持开启，HTTP 状态不符、TLS EOF、超时均剔除。这个检测使用 HTTPS HEAD；Cloudflare trace 仅用于另外的 GET 出口验证，不能用作 HEAD 200 检测。
@@ -37,6 +39,7 @@ pip install -r requirements.txt
 python -m unittest discover -s tests -v
 node cloudflare/tests/dns.cjs cloudflare/worker.mjs
 node cloudflare/tests/run.mjs
+node cloudflare/tests/subscription.cjs
 MIHOMO_BINARY=/absolute/path/to/mihomo python vpngate.py
 ```
 
