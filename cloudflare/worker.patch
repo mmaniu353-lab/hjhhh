@@ -1,0 +1,568 @@
+--- worker.js
++++ worker.js
+@@ -710,7 +710,7 @@
+ }
+ 
+ function 处理叉HTTPUDP请求(首包, reader, request, 反代上下文, responseHeaders) {
+-	const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代地址: 反代上下文.木马反代地址 };
++	const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代上下文, 反代地址: 反代上下文.木马反代地址 };
+ 	return new Response(new ReadableStream({
+ 		async start(controller) {
+ 			let 已关闭 = false;
+@@ -749,7 +749,7 @@
+ 				}
+ 				if (!(首包.协议 === 'trojan' && 木马UDP上下文.反代地址) && 首包.rawData?.byteLength) {
+ 					if (首包.协议 === 'trojan') await 转发木马UDP数据(首包.rawData, 叉桥, 木马UDP上下文, request);
+-					else await forwardataudp(首包.rawData, 叉桥, udpRespHeader, request);
++					else await forwardataudp(首包.rawData, 叉桥, udpRespHeader, request, null, 反代上下文);
+ 					udpRespHeader = null;
+ 				}
+ 				while (true) {
+@@ -757,7 +757,7 @@
+ 					if (done) break;
+ 					if (!value || value.byteLength === 0) continue;
+ 					if (首包.协议 === 'trojan') await 转发木马UDP数据(value, 叉桥, 木马UDP上下文, request);
+-					else await forwardataudp(value, 叉桥, udpRespHeader, request);
++					else await forwardataudp(value, 叉桥, udpRespHeader, request, null, 反代上下文);
+ 					udpRespHeader = null;
+ 				}
+ 			} catch (err) {
+@@ -983,7 +983,7 @@
+ 	const remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null, downlinkDrain: Promise.resolve() };
+ 	const 失效远端连接 = () => 失效TCP连接世代(remoteConnWrapper);
+ 	let isDnsQuery = false;
+-	const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代地址: 反代上下文.木马反代地址 };
++	const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代上下文, 反代地址: 反代上下文.木马反代地址 };
+ 	let 判断是否是木马 = null;
+ 	let 当前写入Socket = null;
+ 	let 远端写入器 = null;
+@@ -1168,7 +1168,7 @@
+ 						if (!payload.byteLength) continue;
+ 						if (isDnsQuery) {
+ 							if (判断是否是木马) await 转发木马UDP数据(payload, grpcBridge, 木马UDP上下文, request);
+-							else await forwardataudp(payload, grpcBridge, null, request);
++							else await forwardataudp(payload, grpcBridge, null, request, null, 反代上下文);
+ 							continue;
+ 						}
+ 						if (remoteConnWrapper.socket || remoteConnWrapper.connectingPromise) {
+@@ -1213,7 +1213,7 @@
+ 								const rawData = rawClientData;
+ 								if (isDnsQuery) {
+ 									if (判断是否是木马) await 转发木马UDP数据(rawData, grpcBridge, 木马UDP上下文, request);
+-									else await forwardataudp(rawData, grpcBridge, null, request);
++									else await forwardataudp(rawData, grpcBridge, null, request, null, 反代上下文);
+ 								}
+ 								else await forwardataTCP(hostname, port, rawData, grpcBridge, null, remoteConnWrapper, yourUUID, request, 反代上下文);
+ 							}
+@@ -1298,7 +1298,7 @@
+ 	const 失效远端连接 = () => 失效TCP连接世代(remoteConnWrapper);
+ 	let isDnsQuery = false;
+ 	let 判断是否是木马 = null;
+-	const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代地址: 反代上下文.木马反代地址 };
++	const 木马UDP上下文 = { 缓存: new Uint8Array(0), 反代上下文, 反代地址: 反代上下文.木马反代地址 };
+ 	const earlyDataHeader = request.headers.get('sec-websocket-protocol') || '';
+ 	const SS模式禁用EarlyData = !!url.searchParams.get('enc');
+ 	let WS上行写入队列 = null;
+@@ -1637,7 +1637,7 @@
+ 		let 当前块字节 = null;
+ 		if (isDnsQuery) {
+ 			if (判断是否是木马) return await 转发木马UDP数据(chunk, serverSock, 木马UDP上下文, request);
+-			return await forwardataudp(chunk, serverSock, null, request);
++			return await forwardataudp(chunk, serverSock, null, request, null, 反代上下文);
+ 		}
+ 		if (判断协议类型 === 'ss') {
+ 			await 处理SS数据(chunk);
+@@ -1701,7 +1701,7 @@
+ 			const rawData = rawClientData;
+ 			if (isDnsQuery) {
+ 				if (判断是否是木马) return 转发木马UDP数据(rawData, serverSock, 木马UDP上下文, request);
+-				return forwardataudp(rawData, serverSock, respHeader, request);
++				return forwardataudp(rawData, serverSock, respHeader, request, null, 反代上下文);
+ 			}
+ 			await forwardataTCP(hostname, port, rawData, serverSock, respHeader, remoteConnWrapper, yourUUID, request, 反代上下文);
+ 		}
+@@ -2107,7 +2107,7 @@
+ 			}
+ 			dns响应上下文.缓存 = 响应输入.slice(responseCursor);
+ 			return 响应帧列表.length ? 响应帧列表 : new Uint8Array(0);
+-		});
++		}, 上下文.反代上下文);
+ 	}
+ 
+ 	if (上下文) 上下文.缓存 = input.slice(cursor);
+@@ -2465,7 +2465,8 @@
+ 	}
+ }
+ 
+-async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null) {
++async function forwardataudp(udpChunk, webSocket, respHeader, request, 响应封装器 = null, 反代上下文 = {}) {
++	if (反代上下文.代理类型 === 'sstp') return forwardSstpUdpDns(udpChunk, webSocket, respHeader, request, 响应封装器, 反代上下文);
+ 	const 请求数据 = 数据转Uint8Array(udpChunk);
+ 	const 请求字节数 = 请求数据.byteLength;
+ 	log(`[UDP转发] 收到 DNS 请求: ${请求字节数}B -> 8.8.4.4:53`);
+@@ -4308,7 +4309,169 @@
+ 	}
+ }
+ //////////////////////////////////////////////////sstpConnect///////////////////////////////////////////////
++// Destination DNS for an SSTP request must use that same VPN Gate exit.
++// The resolver address is literal, so the nested DNS socket cannot recurse.
++const SSTP_DNS_TIMEOUT_MS = 12000;
++const SSTP_DNS_RESOLVER = '8.8.4.4';
++const SSTP_DNS_CACHE = new Map();
++const SSTP_DNS_STREAMS = new WeakMap();
++
++function buildSstpDnsQuery(hostname) {
++	const domain = new URL(`http://${hostname}`).hostname.toLowerCase().replace(/\.$/, '');
++	if (!domain || domain.length > 253 || domain.includes(':')) throw new Error('Invalid SSTP DNS hostname');
++	const labels = domain.split('.').map(label => {
++		const bytes = textEncoder.encode(label);
++		if (!bytes.length || bytes.length > 63) throw new Error('Invalid SSTP DNS label');
++		return 拼接字节数据(new Uint8Array([bytes.length]), bytes);
++	});
++	const name = 拼接字节数据(...labels, new Uint8Array([0]));
++	const query = new Uint8Array(12 + name.length + 4);
++	const view = new DataView(query.buffer);
++	view.setUint16(0, randomSstpUint16());
++	view.setUint16(2, 0x0100);
++	view.setUint16(4, 1);
++	query.set(name, 12);
++	view.setUint16(12 + name.length, 1);
++	view.setUint16(14 + name.length, 1);
++	return query;
++}
++
++function parseSstpDnsA(response, query) {
++	const bytes = 数据转Uint8Array(response);
++	if (bytes.length < 12) throw new Error('Truncated SSTP DNS response');
++	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
++	if (view.getUint16(0) !== new DataView(query.buffer, query.byteOffset, query.byteLength).getUint16(0)) throw new Error('SSTP DNS response ID mismatch');
++	const flags = view.getUint16(2);
++	if (!(flags & 0x8000) || (flags & 0x020f)) throw new Error(`SSTP DNS response failed: ${flags & 15}`);
++	const skipName = start => {
++		let position = start, end = null;
++		const seen = new Set();
++		for (let count = 0; count < 128; count++) {
++			if (position >= bytes.length || seen.has(position)) throw new Error('Invalid SSTP DNS compression');
++			seen.add(position);
++			const length = bytes[position];
++			if (!length) return end ?? position + 1;
++			if ((length & 0xc0) === 0xc0) {
++				if (position + 1 >= bytes.length) throw new Error('Truncated SSTP DNS pointer');
++				end ??= position + 2;
++				position = ((length & 63) << 8) | bytes[position + 1];
++			} else {
++				if (length > 63 || position + 1 + length >= bytes.length) throw new Error('Invalid SSTP DNS name');
++				position += length + 1;
++			}
++		}
++		throw new Error('Invalid SSTP DNS name depth');
++	};
++	let offset = 12;
++	for (let index = 0; index < view.getUint16(4); index++) {
++		offset = skipName(offset) + 4;
++		if (offset > bytes.length) throw new Error('Truncated SSTP DNS question');
++	}
++	const records = [];
++	for (let index = 0; index < view.getUint16(6); index++) {
++		offset = skipName(offset);
++		if (offset + 10 > bytes.length) throw new Error('Truncated SSTP DNS answer');
++		const type = view.getUint16(offset), klass = view.getUint16(offset + 2);
++		const ttl = view.getUint32(offset + 4), size = view.getUint16(offset + 8);
++		offset += 10;
++		if (offset + size > bytes.length) throw new Error('Truncated SSTP DNS data');
++		if (type === 1 && klass === 1 && size === 4) records.push({ type, TTL: ttl, data: [...bytes.subarray(offset, offset + 4)].join('.') });
++		offset += size;
++	}
++	return records;
++}
++
++async function exchangeSstpDns(query, proxy, TCP连接) {
++	let socket, reader, writer;
++	let finished = false;
++	const transports = new Set();
++	const closeQuietly = target => { try { target?.close?.()?.catch?.(() => {}) } catch (e) {} };
++	const trackedConnect = (...args) => {
++		if (finished) throw new Error('SSTP DNS request already finished');
++		const transport = TCP连接(...args);
++		transports.add(transport);
++		return transport;
++	};
++	try {
++		return await withTimeout((async () => {
++			socket = await sstpConnect(proxy, SSTP_DNS_RESOLVER, 53, trackedConnect);
++			socket.closed?.catch?.(() => {});
++			if (finished) { closeQuietly(socket); throw new Error('SSTP DNS setup completed after deadline'); }
++			reader = socket.readable.getReader();
++			writer = socket.writable.getWriter();
++			const framed = new Uint8Array(query.length + 2);
++			new DataView(framed.buffer).setUint16(0, query.length);
++			framed.set(query, 2);
++			await writer.write(framed);
++			let buffered = new Uint8Array(0);
++			for (;;) {
++				const { value, done } = await reader.read();
++				if (done) throw new Error('SSTP DNS socket closed before complete response');
++				buffered = 拼接字节数据(buffered, value);
++				if (buffered.length < 2) continue;
++				const length = (buffered[0] << 8) | buffered[1];
++				if (length < 12) throw new Error('Invalid SSTP DNS response length');
++				if (buffered.length >= length + 2) {
++					const response = buffered.slice(2, length + 2);
++					if (response[0] !== query[0] || response[1] !== query[1] || !(response[2] & 0x80)) throw new Error('SSTP DNS response ID or QR mismatch');
++					return response;
++				}
++				if (buffered.length > 65537) throw new Error('Oversized SSTP DNS response');
++			}
++		})(), SSTP_DNS_TIMEOUT_MS, 'SSTP DNS response timed out');
++	} finally {
++		finished = true;
++		closeQuietly(socket);
++		for (const transport of transports) closeQuietly(transport);
++		try { reader?.cancel?.()?.catch?.(() => {}) } catch (e) {}
++		try { reader?.releaseLock?.() } catch (e) {}
++		try { writer?.releaseLock?.() } catch (e) {}
++	}
++}
++
++async function resolveSstpDnsA(hostname, proxy, TCP连接) {
++	const key = JSON.stringify([proxy.hostname, proxy.port, proxy.username, proxy.password, hostname.toLowerCase()]);
++	const cached = SSTP_DNS_CACHE.get(key);
++	if (cached && cached.expires > Date.now()) return cached.records;
++	const query = buildSstpDnsQuery(hostname);
++	const records = parseSstpDnsA(await exchangeSstpDns(query, proxy, TCP连接), query);
++	const ttl = records.length ? Math.min(...records.map(record => record.TTL), 60) : 0;
++	if (ttl > 0) {
++		if (SSTP_DNS_CACHE.size >= 256) SSTP_DNS_CACHE.delete(SSTP_DNS_CACHE.keys().next().value);
++		SSTP_DNS_CACHE.set(key, { records, expires: Date.now() + ttl * 1000 });
++	}
++	return records;
++}
++
++async function forwardSstpUdpDns(chunk, webSocket, respHeader, request, wrapResponse, route) {
++	let state = SSTP_DNS_STREAMS.get(webSocket);
++	if (!state) {
++		state = { buffered: new Uint8Array(0), header: respHeader };
++		SSTP_DNS_STREAMS.set(webSocket, state);
++	}
++	state.buffered = 拼接字节数据(state.buffered, chunk);
++	while (state.buffered.length >= 2) {
++		const length = (state.buffered[0] << 8) | state.buffered[1];
++		if (length < 12) throw new Error('Invalid SSTP DNS request length');
++		if (state.buffered.length < length + 2) break;
++		const query = state.buffered.slice(2, length + 2);
++		state.buffered = state.buffered.slice(length + 2);
++		const response = await exchangeSstpDns(query, route.代理参数, 创建请求TCP连接器(request));
++		const framed = new Uint8Array(response.length + 2);
++		new DataView(framed.buffer).setUint16(0, response.length);
++		framed.set(response, 2);
++		const wrapped = wrapResponse ? await wrapResponse(framed) : framed;
++		for (const part of Array.isArray(wrapped) ? wrapped : [wrapped]) {
++			if (!part.byteLength || webSocket.readyState !== WebSocket.OPEN) continue;
++			await WebSocket发送并等待(webSocket, state.header ? 拼接字节数据(state.header, part) : part);
++			state.header = null;
++		}
++	}
++}
++
+ const SSTP_TCP_MSS = 1400;
++const SSTP_TCP_RECEIVE_WINDOW = 65535;
++const SSTP_TCP_MAX_RECEIVE_RANGES = 256;
+ const SSTP_EMPTY_BYTES = new Uint8Array(0);
+ 
+ function readSstpUint16(bytes, offset = 0) {
+@@ -4334,7 +4497,7 @@
+ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
+ 	proxy = { ...proxy, username: proxy.username ?? null, password: proxy.password ?? null };
+ 	let bufferedBytes = SSTP_EMPTY_BYTES, pppIdentifier = 1, socket = null, reader = null, writer = null;
+-	let closedSettled = false, resolveClosed, rejectClosed;
++	let closedSettled = false, closing = false, resolveClosed, rejectClosed;
+ 	const closed = new Promise((resolve, reject) => {
+ 		resolveClosed = resolve;
+ 		rejectClosed = reject;
+@@ -4345,11 +4508,13 @@
+ 		settle(value);
+ 	};
+ 	const close = () => {
++		if (closing) return;
++		closing = true;
+ 		try { reader?.cancel?.().catch?.(() => { }) } catch (e) { }
+ 		try { reader?.releaseLock?.() } catch (e) { }
+ 		try { writer?.close?.().catch?.(() => { }) } catch (e) { }
+ 		try { writer?.releaseLock?.() } catch (e) { }
+-		try { socket?.close?.() } catch (e) { }
++		try { socket?.close?.().catch?.(() => { }) } catch (e) { }
+ 		settleClosed(resolveClosed);
+ 	};
+ 
+@@ -4429,6 +4594,40 @@
+ 			offset += length;
+ 		}
+ 		return options;
++	};
++	const writeLinkPacket = packet => withTimeout(writer.write(packet), CONNECT_TIMEOUT_MS, 'SSTP control write timed out');
++	const buildLinkControlPacket = messageType => {
++		const packet = new Uint8Array([0x10, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00]);
++		new DataView(packet.buffer).setUint16(4, messageType);
++		return packet;
++	};
++	// Link control remains active during PPP negotiation, TCP setup, and data transfer.
++	const handleLinkPacket = async packet => {
++		if (packet.isControl) {
++			if (packet.body.byteLength < 4) throw new Error('Invalid SSTP control packet');
++			const messageType = readSstpUint16(packet.body);
++			if (messageType === 0x0008) await writeLinkPacket(buildLinkControlPacket(0x0009));
++			else if (messageType === 0x0003) throw new Error('SSTP server rejected the connection');
++			else if (messageType === 0x0005) throw new Error('SSTP server aborted the connection');
++			else if (messageType === 0x0006) {
++				await writeLinkPacket(buildLinkControlPacket(0x0007));
++				throw new Error('SSTP server disconnected the connection');
++			} else if (messageType === 0x0007) throw new Error('SSTP server acknowledged disconnection');
++			return true;
++		}
++		const ppp = parsePPPFrame(packet.body);
++		if (!ppp || ppp.protocol !== 0xc021 || (ppp.code !== 9 && ppp.code !== 5)) return false;
++		const length = readSstpUint16(ppp.rawPacket, 4);
++		if (length < 4 || length + 2 > ppp.rawPacket.byteLength || (ppp.code === 9 && length < 8)) {
++			throw new Error('Invalid PPP LCP control packet');
++		}
++		const reply = new Uint8Array(ppp.rawPacket.subarray(0, length + 2));
++		reply[2] = ppp.code === 9 ? 10 : 6;
++		// We did not negotiate a local Magic-Number; RFC1661 requires zero here.
++		if (ppp.code === 9) reply.fill(0, 6, 10);
++		await writeLinkPacket(buildSstpDataPacket(reply));
++		if (ppp.code === 5) throw new Error('PPP peer terminated the connection');
++		return true;
+ 	};
+ 
+ 	try {
+@@ -4507,7 +4706,7 @@
+ 
+ 		for (let round = 0; round < 50 && !ipcpFinished; round++) {
+ 			const packet = await readPacket(CONNECT_TIMEOUT_MS);
+-			if (packet.isControl) continue;
++			if (await handleLinkPacket(packet)) continue;
+ 			const ppp = parsePPPFrame(packet.body);
+ 			if (!ppp) continue;
+ 
+@@ -4569,7 +4768,7 @@
+ 		/** @type {string | null} */
+ 		let targetIp = isIPv4(target) ? target : null;
+ 		if (!targetIp) {
+-			const records = await DoH查询(target, 'A');
++			const records = await resolveSstpDnsA(target, proxy, TCP连接);
+ 			const recordData = records.find(item => item.type === 1 && isIPv4(item.data))?.data;
+ 			targetIp = typeof recordData === 'string' ? recordData : null;
+ 		}
+@@ -4607,7 +4806,7 @@
+ 			view.setUint32(36, acknowledgementNumber);
+ 			frame[40] = 0x50;
+ 			frame[41] = flags;
+-			view.setUint16(42, 65535);
++			view.setUint16(42, SSTP_TCP_RECEIVE_WINDOW);
+ 			if (payloadLength) frame.set(bytes, 48);
+ 			tcpPseudoHeader[10] = tcpLength >> 8;
+ 			tcpPseudoHeader[11] = tcpLength & 0xff;
+@@ -4616,34 +4815,78 @@
+ 			return frame;
+ 		};
+ 		const matchIncomingIpPacket = ipPacket => {
+-			if (ipPacket.byteLength < 40 || ipPacket[9] !== 6) return null;
++			if (ipPacket.byteLength < 40 || (ipPacket[0] >> 4) !== 4 || ipPacket[9] !== 6) return null;
+ 			const ipHeaderLength = (ipPacket[0] & 0x0f) * 4;
+-			if (ipPacket.byteLength < ipHeaderLength + 20) return null;
++			const totalLength = readSstpUint16(ipPacket, 2);
++			if (ipHeaderLength < 20 || totalLength < ipHeaderLength + 20 || totalLength > ipPacket.byteLength) return null;
++			if (readSstpUint16(ipPacket, 6) & 0x3fff) return null;
++			for (let index = 0; index < 4; index++) {
++				if (ipPacket[12 + index] !== destinationAddress[index] || ipPacket[16 + index] !== sourceAddress[index]) return null;
++			}
+ 			if (readSstpUint16(ipPacket, ipHeaderLength) !== targetPort) return null;
+ 			if (readSstpUint16(ipPacket, ipHeaderLength + 2) !== sourcePort) return null;
++			const tcpHeaderLength = ((ipPacket[ipHeaderLength + 12] >> 4) & 0x0f) * 4;
++			if (tcpHeaderLength < 20 || ipHeaderLength + tcpHeaderLength > totalLength) return null;
+ 			return {
+ 				flags: ipPacket[ipHeaderLength + 13],
+ 				sequence: readSstpUint32(ipPacket, ipHeaderLength + 4),
+-				payloadOffset: ipHeaderLength + ((ipPacket[ipHeaderLength + 12] >> 4) & 0x0f) * 4
++				acknowledgement: readSstpUint32(ipPacket, ipHeaderLength + 8),
++				payloadOffset: ipHeaderLength + tcpHeaderLength,
++				payloadEnd: totalLength
+ 			};
+ 		};
+ 
+-		await withTimeout(writer.write(buildTcpFrame(0x02)), CONNECT_TIMEOUT_MS, 'SSTP TCP SYN write timed out');
++		const synFrame = buildTcpFrame(0x02);
++		await withTimeout(writer.write(synFrame), CONNECT_TIMEOUT_MS, 'SSTP TCP SYN write timed out');
+ 		sequenceNumber = (sequenceNumber + 1) >>> 0;
+ 		let tcpReady = false;
+-		for (let attempt = 0; attempt < 30; attempt++) {
+-			const packet = await readPacket(CONNECT_TIMEOUT_MS);
+-			if (packet.isControl) continue;
++		let pendingHandshakePacket = null, synRetransmissions = 0, synRetryInterval = 1000;
++		const handshakeDeadline = Date.now() + CONNECT_TIMEOUT_MS;
++		let nextSynRetry = Date.now() + synRetryInterval;
++		for (let attempt = 0; attempt < 100 && Date.now() < handshakeDeadline;) {
++			// A retransmission timer must not leave a second socket read in flight.
++			if (!pendingHandshakePacket) pendingHandshakePacket = readPacket(CONNECT_TIMEOUT_MS);
++			let retryTimer;
++			let result;
++			try {
++				result = await Promise.race([
++					pendingHandshakePacket.then(packet => ({ packet })),
++					new Promise(resolve => { retryTimer = setTimeout(() => resolve(null), Math.max(0, Math.min(nextSynRetry, handshakeDeadline) - Date.now())) })
++				]);
++			} finally { clearTimeout(retryTimer) }
++			if (!result) {
++				if (Date.now() >= handshakeDeadline) break;
++				if (synRetransmissions < 3) {
++					await withTimeout(writer.write(synFrame), CONNECT_TIMEOUT_MS, 'SSTP TCP SYN retry write timed out');
++					synRetransmissions++;
++					synRetryInterval *= 2;
++					nextSynRetry = Date.now() + synRetryInterval;
++				} else nextSynRetry = handshakeDeadline;
++				continue;
++			}
++			const packet = result.packet;
++			pendingHandshakePacket = null;
++			attempt++;
++			if (await handleLinkPacket(packet)) continue;
+ 			const ppp = parsePPPFrame(packet.body);
+ 			if (!ppp || ppp.protocol !== 0x0021) continue;
+ 			const tcp = matchIncomingIpPacket(ppp.ipPacket);
++			if (tcp && (tcp.flags & 0x14) === 0x14 && tcp.acknowledgement === sequenceNumber) throw new Error('TCP connection reset through SSTP');
+ 			if (!tcp || (tcp.flags & 0x12) !== 0x12) continue;
++			if (tcp.acknowledgement !== sequenceNumber) continue;
+ 			acknowledgementNumber = (tcp.sequence + 1) >>> 0;
+ 			await withTimeout(writer.write(buildTcpFrame(0x10)), CONNECT_TIMEOUT_MS, 'SSTP TCP ACK write timed out');
+ 			tcpReady = true;
+ 			break;
+ 		}
+ 		if (!tcpReady) throw new Error('TCP handshake through SSTP timed out');
++		let localFinSent = false;
++		const sendLocalFin = () => {
++			const frame = buildTcpFrame(localFinSent ? 0x10 : 0x11);
++			if (!localFinSent) sequenceNumber = (sequenceNumber + 1) >>> 0;
++			localFinSent = true;
++			return writeLinkPacket(frame);
++		};
+ 
+ 		/** @type {ReadableStreamDefaultController<Uint8Array> | null} */
+ 		let streamController = null;
+@@ -4659,36 +4902,74 @@
+ 		(async () => {
+ 			try {
+ 				let pendingChunks = [], pendingLength = 0;
++				let receiveRanges = [], pendingFinSequence = null;
++				const sequenceDistance = sequence => (sequence - acknowledgementNumber) | 0;
+ 				const flush = () => {
+ 					if (!pendingLength) return;
+ 					if (!streamController) throw new Error('SSTP readable stream is not ready');
+ 					streamController.enqueue(pendingChunks.length === 1 ? pendingChunks[0] : 拼接字节数据(...pendingChunks));
+ 					pendingChunks = [];
+ 					pendingLength = 0;
+-					writer.write(buildTcpFrame(0x10)).catch(() => { });
+ 				};
++				const acceptPayload = (sequence, payload) => {
++					const distance = sequenceDistance(sequence);
++					let cursor = Math.max(0, distance);
++					let end = Math.min(SSTP_TCP_RECEIVE_WINDOW, distance + payload.byteLength);
++					if (pendingFinSequence !== null) end = Math.min(end, sequenceDistance(pendingFinSequence));
++					if (cursor >= end) return;
++					const additions = [];
++					for (const range of receiveRanges) {
++						const start = sequenceDistance(range.sequence), rangeEnd = start + range.payload.byteLength;
++						if (rangeEnd <= cursor) continue;
++						if (start >= end) break;
++						if (start > cursor) {
++							const boundary = Math.min(start, end);
++							additions.push({ sequence: (acknowledgementNumber + cursor) >>> 0, payload: new Uint8Array(payload.subarray(cursor - distance, boundary - distance)) });
++						}
++						cursor = Math.max(cursor, rangeEnd);
++						if (cursor >= end) break;
++					}
++					if (cursor < end) additions.push({ sequence: (acknowledgementNumber + cursor) >>> 0, payload: new Uint8Array(payload.subarray(cursor - distance, end - distance)) });
++					// Drop excess future ranges; their missing bytes will not be ACKed.
++					for (const range of additions) if (receiveRanges.length < SSTP_TCP_MAX_RECEIVE_RANGES || range.sequence === acknowledgementNumber) receiveRanges.push(range);
++					receiveRanges.sort((left, right) => sequenceDistance(left.sequence) - sequenceDistance(right.sequence));
++					while (receiveRanges.length && receiveRanges[0].sequence === acknowledgementNumber) {
++						const range = receiveRanges.shift();
++						const length = pendingFinSequence === null ? range.payload.byteLength : Math.min(range.payload.byteLength, sequenceDistance(pendingFinSequence));
++						if (length > 0) {
++							pendingChunks.push(length === range.payload.byteLength ? range.payload : range.payload.subarray(0, length));
++							pendingLength += length;
++							acknowledgementNumber = (acknowledgementNumber + length) >>> 0;
++						}
++						if (pendingFinSequence !== null && acknowledgementNumber === pendingFinSequence) break;
++					}
++				};
+ 
+ 				for (; ;) {
++					if (bufferedBytes.byteLength < 4) flush();
+ 					const packet = await readPacket(60000);
+-					if (packet.isControl) continue;
++					if (await handleLinkPacket(packet)) continue;
+ 					const ppp = parsePPPFrame(packet.body);
+ 					if (!ppp || ppp.protocol !== 0x0021) continue;
+ 					const incoming = matchIncomingIpPacket(ppp.ipPacket);
+ 					if (!incoming) continue;
+-
+-					if (incoming.payloadOffset < ppp.ipPacket.byteLength) {
+-						const payload = ppp.ipPacket.subarray(incoming.payloadOffset);
+-						if (payload.byteLength) {
+-							acknowledgementNumber = (incoming.sequence + payload.byteLength) >>> 0;
+-							pendingChunks.push(new Uint8Array(payload));
+-							pendingLength += payload.byteLength;
+-						}
++					if (incoming.flags & 0x04) {
++						if (incoming.sequence === acknowledgementNumber) throw new Error('TCP peer reset the connection through SSTP');
++						await writeLinkPacket(buildTcpFrame(0x10));
++						continue;
+ 					}
+-
++					if (incoming.flags & 0x02) { await writeLinkPacket(buildTcpFrame(0x10)); continue; }
++					const payload = ppp.ipPacket.subarray(incoming.payloadOffset, incoming.payloadEnd);
+ 					if (incoming.flags & 0x01) {
++						const finSequence = (incoming.sequence + payload.byteLength) >>> 0;
++						const distance = sequenceDistance(finSequence);
++						if (distance >= 0 && distance < SSTP_TCP_RECEIVE_WINDOW && (pendingFinSequence === null || distance < sequenceDistance(pendingFinSequence))) pendingFinSequence = finSequence;
++					}
++					if (payload.byteLength) acceptPayload(incoming.sequence, payload);
++					if (pendingFinSequence !== null && pendingFinSequence === acknowledgementNumber) {
+ 						flush();
+ 						acknowledgementNumber = (acknowledgementNumber + 1) >>> 0;
+-						writer.write(buildTcpFrame(0x11)).catch(() => { });
++						await sendLocalFin();
+ 						const controller = streamController;
+ 						if (controller) {
+ 							try { controller.close() } catch (e) { }
+@@ -4698,6 +4979,7 @@
+ 					}
+ 
+ 					if (bufferedBytes.byteLength < 4 || pendingLength >= 32768) flush();
++					if (payload.byteLength || (incoming.flags & 0x01)) await writeLinkPacket(buildTcpFrame(0x10));
+ 				}
+ 			} catch (error) {
+ 				const controller = streamController;
+@@ -4705,7 +4987,7 @@
+ 					try { controller.error(error) } catch (e) { }
+ 				}
+ 				settleClosed(rejectClosed, error);
+-				try { socket?.close?.() } catch (e) { }
++				close();
+ 			}
+ 		})();
+ 
+@@ -4727,11 +5009,11 @@
+ 				await writer.write(拼接字节数据(...frames));
+ 			},
+ 			close() {
+-				return writer.write(buildTcpFrame(0x11)).catch(() => { });
++				return sendLocalFin();
+ 			},
+ 			abort(error) {
++				if (error) settleClosed(rejectClosed, error);
+ 				close();
+-				if (error) settleClosed(rejectClosed, error);
+ 			}
+ 		});
+ 

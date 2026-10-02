@@ -1,0 +1,3 @@
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.patch -whitespace

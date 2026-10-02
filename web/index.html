@@ -45,7 +45,8 @@
 <body>
 <div class="wrap">
   <h1>VPN Gate · SSTP 节点检测</h1>
-  <div class="sub">节点来自 VPN Gate（仅 TCP 入口中继），检测由 Cloudflare Worker 执行，GitHub Actions 定时刷新</div>
+  <div class="sub">节点来自 VPN Gate，经过连续出口检测及真实 HTTPS 验证，GitHub Actions 计划每 15 分钟刷新</div>
+  <div class="legend"><a href="mihomo.yaml" style="color:var(--accent)">FlClash / Mihomo 自动更新订阅</a> · 同国家故障切换，DNS 经过所选住宅出口。启用客户端 TUN 与配置自身 DNS。</div>
 
   <div class="cards" id="cards"></div>
 
@@ -75,7 +76,7 @@ function renderCards(d) {
     ["最后更新", d.generated_at || "-", "时区 UTC"],
     ["SSTP 节点", s.sstp_nodes, "筛选自 VPN Gate"],
     ["已检测", s.checked, "提交给 Worker"],
-    ["可用节点", s.success, "success = true"],
+    ["可用节点", s.success, "出口 + HTTPS 检测通过"],
     ["国家数量", s.countries, "按可用节点统计"],
     ["住宅(估算)", s.residential_est, "数据中心 " + (s.datacenter_est || 0)]
   ];

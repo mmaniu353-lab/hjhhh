@@ -1,9 +1,9 @@
 name: VPN Gate Node Check
 
 on:
-  # 定时检测: 默认每 30 分钟一次。改成每 60 分钟: cron: "0 * * * *"
+  # Avoid busy hour boundaries; GitHub may delay scheduled runs.
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -31,13 +31,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Regression tests
+        run: |
+          python -m unittest discover -s tests -v
+          node --check cloudflare/worker.mjs
+          node cloudflare/tests/dns.cjs cloudflare/worker.mjs
+          node cloudflare/tests/run.mjs
+
+      - name: Download pinned official Mihomo for real HTTPS verification
+        run: python download_mihomo.py --output "${RUNNER_TEMP}/mihomo"
+
       - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
         run: python vpngate.py
         env:
-          # 已部署的检测 Worker (不要改动: 检测统一走这里)
-          CHECK_WORKER: "https://check.helei.kdns.fr/check?sstp=vpn:vpn@"
-          CHECK_CONCURRENCY: "32"
-          CHECK_TIMEOUT: "90"
+          CHECK_WORKER: "https://ch.opopoiovcc.kdns.fr/check?sstp=vpn:vpn@"
+          CHECK_CONCURRENCY: "8"
+          CHECK_TIMEOUT: "45"
+          VERIFY_PASSES: "2"
+          SITE_URL: "https://mmaniu353-lab.github.io/hjhhh"
+          MIHOMO_BINARY: "${{ runner.temp }}/mihomo"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
@@ -71,4 +83,4 @@ jobs:
         uses: actions/deploy-pages@v4
 
       - name: Show site URL
-        run: 'echo "site: https://jerylihub.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
+        run: 'echo "site: ${{ steps.deployment.outputs.page_url }} (deploy outcome: ${{ steps.deployment.outcome }})"'

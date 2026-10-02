@@ -21,6 +21,9 @@ VPN Gate SSTP 节点检测流水线
 import base64
 import csv
 import io
+import hashlib
+import ipaddress
+import socket
 import json
 import os
 import re
@@ -31,6 +34,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 import requests
+import yaml
 
 # 保证日志在任何控制台编码下都能输出 (Windows GBK 控制台不会崩)
 for _stream in (sys.stdout, sys.stderr):
@@ -52,8 +56,10 @@ VPNGATE_MIRROR = os.environ.get(
 )
 # 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://ch.opopoiovcc.kdns.fr/check?sstp=vpn:vpn@")
-CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
-CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
+CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "8")))
+CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "45"))
+VERIFY_PASSES = max(1, int(os.environ.get("VERIFY_PASSES", "2")))
+SITE_URL = os.environ.get("SITE_URL", "https://mmaniu353-lab.github.io/hjhhh").rstrip("/")
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取数据源超时
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
@@ -315,6 +321,7 @@ def check_one(node, session):
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
     out["status"] = "failed"
+    out["success"] = False
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
     out["residential"] = "unknown"
@@ -325,16 +332,25 @@ def check_one(node, session):
             out["worker_error"] = True
             return out
         j = r.json()
-        ok = bool(j.get("success"))
-        out["success"] = ok
-        out["status"] = "success" if ok else "failed"
+        if not isinstance(j, dict):
+            raise ValueError("Checker response must be an object")
+        ok = j.get("success") is True
         out["latency_ms"] = j.get("responseTime")
         out["colo"] = j.get("colo")
         out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
+        if not ok:
+            return out
         # SSTP 版 Worker: 顶层直接返回 exit, 含真实 is_datacenter 标志 + 嵌套 asn 对象
-        exit_info = j.get("exit") or {}
+        exit_info = j.get("exit")
+        if not isinstance(exit_info, dict):
+            raise ValueError("Checker did not return valid exit information")
+        exit_address = ipaddress.ip_address(exit_info.get("ip") or "")
+        if not exit_address.is_global:
+            raise ValueError("Checker did not return a public exit IP")
         if exit_info:
             asn = exit_info.get("asn") or {}
+            if not isinstance(asn, dict):
+                raise ValueError("Checker returned invalid ASN information")
             org = asn.get("org") or asn.get("name") or ""
             out["exit"] = {
                 "ip": exit_info.get("ip"),
@@ -350,18 +366,48 @@ def check_one(node, session):
             out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
         else:
             out["residential"] = classify_network(out["host"], None, None)
+        out["success"] = True
+        out["status"] = "success"
         return out
     except Exception as exc:
+        out["success"] = False
+        out["status"] = "failed"
         out["error"] = f"{type(exc).__name__}: {exc}"
         out["worker_error"] = True
         return out
 
 
-def check_all(nodes, session):
-    """32 并发 (与网页端一致)。单节点失败不影响整体; 但区分'节点不可用'与'Worker 异常'。"""
+def check_stable_node(node):
+    """Each node owns its HTTP session; only consecutive passes with a stable exit qualify."""
+    checks = []
+    with requests.Session() as session:
+        for _ in range(VERIFY_PASSES):
+            result = check_one(node, session)
+            result["verification_passes"] = len(checks)
+            if not result.get("success"):
+                return result
+            try:
+                ipaddress.ip_address((result.get("exit") or {}).get("ip") or "")
+            except (ValueError, TypeError, AttributeError):
+                result.update(success=False, status="failed", error="Verification requires a valid exit IP")
+                return result
+            if checks and (checks[0].get("exit") or {}).get("ip") != (result.get("exit") or {}).get("ip"):
+                result.update(success=False, status="failed", error="Exit IP changed during consecutive checks")
+                return result
+            checks.append(result)
+    result = checks[-1]
+    result["verification_passes"] = len(checks)
+    delays = [check["latency_ms"] for check in checks if isinstance(check.get("latency_ms"), (int, float))]
+    if delays:
+        result["latency_ms"] = max(delays)
+    return result
+
+
+def check_all(nodes, session=None):
+    """Check candidates with separate sessions and require repeated successful connections."""
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
+        futures = [pool.submit(check_stable_node, n) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
@@ -407,21 +453,29 @@ def build_outputs(results, raw_count, sstp_count, source):
     return data
 
 
-CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains.txt")
+CHAIN_URL = os.environ.get("CHAIN_URL", SITE_URL + "/chains.txt")
+
+
+def node_name(node, country_name=None):
+    code = str(node.get("country_code") or "?").upper()
+    country = COUNTRY_ZH.get(code) or country_name or code
+    kind = "住宅" if node.get("residential") == "residential" else "机房"
+    identity = f"{node['host'].lower()}:{node['port']}"
+    suffix = hashlib.sha256(identity.encode()).hexdigest()[:8]
+    return f"{country}-{kind}-{suffix}"
 
 
 def build_chains_text(data):
-    """生成 edgetunnel 链式代理清单: 按国家分组, 每国编号固定, 住宅优先, 延迟升序。
-    每行 = 「名字 + $sstp://vpn:vpn@host:port」, 名字不变, 指令每 30 分钟自动换。"""
+    """名字绑定 host:port，不会因为排序变化而指向另一出口。"""
     countries = data["countries"]
     lines = [
         "# VPN Gate SSTP 节点 -> edgetunnel 链式代理清单",
-        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
+        f"# 自动更新: {data['generated_at']} (计划每 15 分钟重新检测，GitHub 可能延迟)",
         f"# 固定地址: {CHAIN_URL}",
         "#",
         "# 用法: 在 edgetunnel 节点备注里直接粘贴下面任意一行 (名字与指令连写)",
-        "#   例: 日本-住宅-01$sstp://vpn:vpn@vpnxxx.opengw.net:443",
-        "# 名字保持不变, 只有 $sstp:// 后面的地址每 30 分钟自动更换",
+        "#   例: 日本-住宅-1234abcd$sstp://vpn:vpn@vpnxxx.opengw.net:443",
+        "# 名字绑定节点地址; 自动故障切换请使用 mihomo.yaml 订阅",
         "# 账号密码固定 vpn:vpn ; 端口必须保留",
         "# ========================================================",
     ]
@@ -448,42 +502,41 @@ def build_chains_text(data):
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         for i, n in enumerate(res_nodes, 1):
-            lines.append(f"{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            lines.append(f"{node_name(n, zh)}$sstp://vpn:vpn@{n['host']}:{n['port']}")
         for i, n in enumerate(dc_nodes, 1):
-            lines.append(f"{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            lines.append(f"{node_name(n, zh)}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
 
-# edgetunnel 入口地址池: 客户端直连 Cloudflare 的优选 IP:端口 (循环分配给每个国家节点当入口)
+# 可选的用户指定入口；默认使用自有 Worker 域名解析出的 Cloudflare IPv4。
 # 可通过环境变量 EDGE_HOSTS 覆盖 (逗号分隔)
 EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
         "EDGE_HOSTS",
-        "hzytjy.cn:443,hzytjy.cn:443,ali.nonull.pp.ua:443,auto.dolby.dpdns.org:443,"
-        "cdn.cnno.de:443,saas.sin.fan:443,www.xiaoshuofen.com:443",
+        "",
     ).split(",")
     if h.strip()
 ]
 
-HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.txt")
+HOSTS_URL = os.environ.get("HOSTS_URL", SITE_URL + "/hosts.txt")
 
 
 def build_hosts_text(data):
     """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。
-    每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。"""
+    每行 = 入口地址#名字$sstp://... ; 名字绑定 SSTP 节点。"""
     countries = data["countries"]
-    # 入口: 默认用 7 个实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
+    # 仅使用自有域名的地址；可用 HOSTS_ENTRY 覆盖(逗号分隔)。
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{ip}:443" for ip in get_entry_addresses()]
     lines = [
         "# edgetunnel「自定义优选IP」清单 (整段复制, 追加到后台现有内容后面)",
-        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
+        f"# 自动更新: {data['generated_at']} (计划每 15 分钟重新检测，GitHub 可能延迟)",
         f"# 固定地址: {HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
-        "# 入口用 7 个实测可用优选域名循环分配",
-        "# 名字 = 国家-住宅/机房-编号, 直接区分住宅与机房",
-        "# 名字固定; 只有 $sstp:// 后面的节点地址每 30 分钟自动更换",
+        "# 默认入口是自有 Worker 的 Cloudflare IPv4，避免额外域名依赖",
+        "# 名字 = 国家-住宅/机房-地址摘要, 直接区分住宅与机房",
+        "# 名字绑定节点地址; 自动故障切换请使用 mihomo.yaml 订阅",
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
         "# ========================================================",
     ]
@@ -513,11 +566,11 @@ def build_hosts_text(data):
         for i, n in enumerate(res_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            lines.append(f"{entry}#{node_name(n, zh)}$sstp://vpn:vpn@{n['host']}:{n['port']}")
         for i, n in enumerate(dc_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            lines.append(f"{entry}#{node_name(n, zh)}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
 
@@ -525,7 +578,7 @@ def build_hosts_text(data):
 EDT_UUID = os.environ.get("EDT_UUID", "5ed92fca-0651-4f04-958b-ff71f5469df4")
 EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "fgfg.opopoiovcc.kdns.fr")
 EDT_FINGERPRINT = os.environ.get("EDT_FINGERPRINT", "chrome")
-SUB_URL = os.environ.get("SUB_URL", "https://jerylihub.github.io/gate/sub.txt")
+SUB_URL = os.environ.get("SUB_URL", SITE_URL + "/sub.txt")
 
 
 def _b64_secret_encode(plaintext, secret):
@@ -566,10 +619,10 @@ def build_sub_text(data):
     countries = data["countries"]
     lines = [
         "# edgetunnel 完整订阅 (vless://) —— 填进后台「订阅链接」URL",
-        f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
+        f"# 自动更新: {data['generated_at']} (计划每 15 分钟重新检测，GitHub 可能延迟)",
         f"# 固定地址: {SUB_URL}",
         f"# 节点域名: {EDT_DOMAIN} (传输 ws / TLS / fingerprint {EDT_FINGERPRINT})",
-        "# 名字固定; $sstp:// 链式代理(编码在 path)每 30 分钟自动更换",
+        "# 名字绑定节点地址; 自动故障切换请使用 mihomo.yaml 订阅",
         "# 账号密码固定 vpn:vpn ; 节点端口已编码进 path",
         "# ========================================================",
     ]
@@ -590,7 +643,7 @@ def build_sub_text(data):
             ),
         )
         for i, n in enumerate(nodes, 1):
-            name = f"{zh}-{i:02d}"
+            name = node_name(n, zh)
             chain = {"type": "sstp", **_socks5_account(f"vpn:vpn@{n['host']}:{n['port']}", 443)}
             chain_json = json.dumps(chain, separators=(",", ":"))
             enc = _b64_secret_encode(chain_json, EDT_UUID)
@@ -602,6 +655,83 @@ def build_sub_text(data):
             )
             lines.append(link)
     return "\n".join(lines) + "\n"
+
+
+def get_entry_addresses():
+    """Only resolve our own front-door hostname; the client can dial these literal IPv4 addresses."""
+    override = os.environ.get("EDT_ENTRY_IPS", "").strip()
+    if override:
+        addresses = [str(ipaddress.IPv4Address(value.strip())) for value in override.split(",")]
+    else:
+        addresses = sorted({item[4][0] for item in socket.getaddrinfo(EDT_DOMAIN, 443, socket.AF_INET, socket.SOCK_STREAM)})
+    if not addresses:
+        raise RuntimeError("Could not resolve own Cloudflare entry; previous deployment is preserved")
+    return addresses
+
+
+def build_mihomo_config(data):
+    """Strict residential profile plus a renewable provider; no public traffic falls back to DIRECT."""
+    nodes = sorted([n for n in data["available"] if n.get("residential") == "residential"],
+                   key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
+    proxies = []
+    entries = get_entry_addresses()
+    for index, node in enumerate(nodes):
+        proxies.append(build_proxy(node, entries[index % len(entries)]))
+    codes = sorted({n["country_code"] for n in nodes}, key=lambda code: (code != "JP", code))
+    groups = []
+    for code in codes:
+        country = COUNTRY_ZH.get(code) or code
+        groups.append({"name": country + "住宅自动", "type": "fallback", "use": ["住宅节点"],
+                       "proxies": ["REJECT"],
+                       "filter": "^" + re.escape(country) + "-住宅-", "empty-fallback": "REJECT",
+                       "url": "https://www.gstatic.com/generate_204", "expected-status": 204,
+                       "interval": 180, "timeout": 15000, "max-failed-times": 2,
+                       "lazy": False, "disable-udp": True})
+    choices = [g["name"] for g in groups]
+    groups.insert(0, {"name": "住宅出口", "type": "select", "proxies": choices or ["REJECT"],
+                      "use": ["住宅节点"], "empty-fallback": "REJECT", "disable-udp": True})
+    bootstrap = ["https://223.5.5.5/dns-query#name-cert-verify=dns.alidns.com", "https://1.1.1.1/dns-query"]
+    cfg = {
+        "mixed-port": 2087, "allow-lan": False, "mode": "rule", "ipv6": False,
+        "log-level": "warning", "unified-delay": True, "tcp-concurrent": True,
+        "keep-alive-interval": 20, "profile": {"store-selected": True, "store-fake-ip": True},
+        "tun": {"enable": True, "stack": "mixed", "auto-route": True, "auto-detect-interface": True,
+                "strict-route": True, "dns-hijack": ["any:53", "tcp://any:53"], "mtu": 1400},
+        "dns": {"enable": True, "listen": "127.0.0.1:1053", "ipv6": False, "prefer-h3": False,
+                "enhanced-mode": "fake-ip", "fake-ip-range": "198.18.0.1/16", "respect-rules": True,
+                "default-nameserver": bootstrap, "proxy-server-nameserver": bootstrap,
+                "direct-nameserver": bootstrap, "nameserver": ["https://8.8.4.4/dns-query#住宅出口"],
+                "fallback": [], "use-system-hosts": False, "fake-ip-filter": ["*.lan", "*.local", "localhost"]},
+        "proxy-providers": {"住宅节点": {"type": "http", "url": SITE_URL + "/proxies.yaml",
+                            "path": "./providers/hjhhh-residential.yaml", "interval": 900, "proxy": "DIRECT",
+                            "health-check": {"enable": True, "url": "https://www.gstatic.com/generate_204",
+                                             "expected-status": 204, "interval": 180, "timeout": 15000, "lazy": False}}},
+        "proxy-groups": groups,
+        "rules": ["AND,((NETWORK,UDP),(DST-PORT,443)),REJECT",
+                  "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve", "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+                  "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve", "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+                  "MATCH,住宅出口"],
+    }
+    return cfg, {"proxies": proxies}
+
+
+def build_proxy(node, entry):
+    chain = {"type": "sstp", **_socks5_account(f"vpn:vpn@{node['host']}:{node['port']}", 443)}
+    path = "/video/" + _b64_secret_encode(json.dumps(chain, separators=(",", ":")), EDT_UUID)
+    return {"name": node_name(node), "type": "vless", "server": entry,
+            "port": 443, "uuid": EDT_UUID, "tls": True, "udp": False,
+            "servername": EDT_DOMAIN, "skip-cert-verify": False,
+            "client-fingerprint": EDT_FINGERPRINT, "network": "ws",
+            "ws-opts": {"path": path, "headers": {"Host": EDT_DOMAIN}}}
+
+
+def verify_end_to_end(results):
+    binary = os.environ.get('MIHOMO_BINARY', '').strip()
+    if not binary:
+        log('HTTPS END TO END', '未配置 MIHOMO_BINARY，跳过完整链路验证；生产 workflow 必须配置')
+        return results
+    from end_to_end import verify_nodes
+    return verify_nodes(results, binary)
 
 
 def write_outputs(data):
@@ -636,6 +766,10 @@ def write_outputs(data):
     sub_path = os.path.join(PUBLIC_DIR, "sub.txt")
     with open(sub_path, "w", encoding="utf-8") as f:
         f.write(build_sub_text(data))
+    config, pool = build_mihomo_config(data)
+    for filename, value in [("mihomo.yaml", config), ("proxies.yaml", pool)]:
+        with open(os.path.join(PUBLIC_DIR, filename), "w", encoding="utf-8") as f:
+            yaml.safe_dump(value, f, allow_unicode=True, sort_keys=False)
     return data_path, html_path, chains_path, hosts_path, sub_path
 
 
@@ -669,6 +803,7 @@ def main():
     log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
     t0 = time.time()
     results = check_all(uniq, session)
+    results = verify_end_to_end(results)
     elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
@@ -680,8 +815,10 @@ def main():
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
 
     # 硬性失败: Worker 完全不可达 (没有任何一个请求拿到正常响应)
-    if uniq and not success and len(worker_errors) == len(uniq):
-        die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
+    if not success:
+        die("没有节点通过连续检测 — 本次运行失败，保留上一次已部署的订阅")
+    if not any(node.get("residential") == "residential" for node in success):
+        die("没有住宅估算节点通过连续检测 — 保留上次住宅订阅，不发布空代理集合")
 
     # 4) 结果 + 网页
     data = build_outputs(results, raw_count, sstp_count, source)
