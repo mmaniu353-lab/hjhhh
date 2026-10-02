@@ -14,15 +14,16 @@ import yaml
 
 HTTPS_CASES = [('https://www.gstatic.com/generate_204', '204'),
                ('https://cp.cloudflare.com/generate_204', '204')]
+STABILITY_CASES = [('https://1.1.1.1/', '301')] * 2
 
 
-def check_https_node(node, session, api_url, timeout_ms=15000):
+def check_https_node(node, session, api_url, timeout_ms=15000, proxy_name=None):
     from vpngate import node_name
     result = dict(node)
     delays = []
     try:
-        for url, expected in HTTPS_CASES:
-            proxy_url = api_url + '/proxies/' + quote(node_name(node), safe='')
+        for url, expected in HTTPS_CASES + STABILITY_CASES:
+            proxy_url = api_url + '/proxies/' + quote(proxy_name or node_name(node), safe='')
             response = session.get(proxy_url + '/delay',
                                    params={'url':url, 'expected':expected, 'timeout':timeout_ms},
                                    timeout=timeout_ms / 1000 + 5)
@@ -37,10 +38,25 @@ def check_https_node(node, session, api_url, timeout_ms=15000):
             if state.status_code != 200 or state.json().get('extra', {}).get(url, {}).get('alive') is not True:
                 raise RuntimeError('HTTPS response did not match expected HTTP status ' + expected)
             delays.append(delay)
-        result['https_checks'] = len(delays)
-        result['https_latency_ms'] = max(delays)
+        result['https_checks'] = len(HTTPS_CASES)
+        result['stability_tls_checks'] = len(STABILITY_CASES)
+        result['https_latency_ms'] = max(delays[:len(HTTPS_CASES)])
     except Exception as error:
         result.update(success=False, status='failed', error=f'HTTPS verification: {error}')
+    return result
+
+
+def check_entry_routes(node, session, api_url, entries):
+    """Publish the exact entry which passed both HTTPS destinations, retrying a failed route."""
+    from vpngate import node_name
+    result = dict(node, success=False, status='failed', error='No configured entry route')
+    result.pop('entry_address', None)
+    for entry in entries:
+        result = check_https_node(node, session, api_url, proxy_name=node_name(node) + '@' + entry)
+        result.pop('entry_address', None)
+        if result.get('success'):
+            result['entry_address'] = entry
+            return result
     return result
 
 
@@ -50,7 +66,12 @@ def verify_nodes(results, binary):
     if not candidates:
         return results
     entries = get_entry_addresses()
-    proxies = [build_proxy(node, entries[index % len(entries)]) for index, node in enumerate(candidates)]
+    proxies = []
+    for node in candidates:
+        for entry in entries:
+            proxy = build_proxy(node, entry)
+            proxy['name'] = node_name(node) + '@' + entry
+            proxies.append(proxy)
     with socket.socket() as reservation:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
@@ -89,7 +110,7 @@ def verify_nodes(results, binary):
                     with requests.Session() as session:
                         session.trust_env = False
                         session.headers['Authorization'] = 'Bearer ' + secret
-                        result = check_https_node(node, session, api_url)
+                        result = check_entry_routes(node, session, api_url, entries)
                     log('HTTPS END TO END', f"{node_name(node)}: " + ('通过两个 HTTPS 目标' if result['success'] else result['error']))
                     return result
 

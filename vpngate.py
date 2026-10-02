@@ -3,7 +3,7 @@
 VPN Gate SSTP 节点检测流水线
 ============================
 流程:
-  1. 获取 VPN Gate 原始节点 (官方 api/iphone CSV, 失败时回退 GitHub 预解析镜像)
+  1. 并发合并官方 HTTPS CSV、GitHub 镜像与 24 小时内已发布的候选节点
   2. 只保留「带 TCP 入口」的中继 = SSTP 可用节点
      (OpenVPN 配置里 proto tcp + remote <ip> <port>; UDP-only 中继无法走 SSTP/xray 链, 直接丢弃)
   3. 按 host+port+protocol 去重
@@ -25,6 +25,7 @@ import hashlib
 import ipaddress
 import socket
 import json
+import math
 import os
 import re
 import sys
@@ -48,8 +49,8 @@ for _stream in (sys.stdout, sys.stderr):
 # ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
-VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
-# 官方接口失败时的回退数据源: 预解析 JSON 镜像 (字段与官方 CSV 同源)
+VPNGATE_API = os.environ.get("VPNGATE_API", "https://www.vpngate.net/api/iphone/")
+# 独立补充数据源: 预解析 JSON 镜像 (字段与官方 CSV 同源)
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
@@ -64,6 +65,8 @@ MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))              # 拉取数据源超时
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
+PREVIOUS_MAX_AGE_SECONDS = 24 * 60 * 60
+PREVIOUS_MAX_CANDIDATES = 512
 
 # 出口数据中心的关键词启发 (判断"是否住宅 IP"用, 页面标注为估算)
 DATA_CENTER_ORG_KEYWORDS = [
@@ -124,37 +127,37 @@ def die(msg):
 # 第 1 步: 获取 VPN Gate 原始节点
 # ---------------------------------------------------------------------------
 def fetch_vpngate():
-    """返回 (rows, source)。rows: [{host, ip, country_long, country_short, config_b64}]
-    官方 API 失败时回退镜像 JSON; 两个都失败 -> 直接 die (exit 1)。"""
-    # --- 主源: 官方 CSV ---
-    try:
-        log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
-        resp = requests.get(
-            VPNGATE_API,
-            timeout=HTTP_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"},
-        )
-        resp.raise_for_status()
-        rows = parse_csv(resp.text)
-        if rows:
-            log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
-            return rows, "vpngate.net/api/iphone"
-        raise RuntimeError("官方 API 返回 0 行数据")
-    except Exception as exc:
-        log("VPN GATE", f"官方 API 获取失败: {exc}")
+    """Merge independent discovery sources; all candidates still enter current verification.
 
-    # --- 回退源: GitHub 预解析镜像 ---
-    try:
-        log("VPN GATE", f"回退镜像: {VPNGATE_MIRROR}")
-        resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        rows = parse_mirror_json(resp.json())
-        if rows:
-            log("VPN GATE", f"回退源(镜像) 获取到 {len(rows)} 个原始节点")
-            return rows, "github-mirror"
-    except Exception as exc:
-        log("VPN GATE", f"回退镜像也失败: {exc}")
-    die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败 (不生成空结果, 本次运行判定失败)")
+    Previous Pages results only supply addresses, never successful checks or exit evidence.
+    Source order is deterministic so duplicate candidates retain official source metadata.
+    """
+    sources = [
+        ("vpngate.net/api/iphone", VPNGATE_API, lambda response: parse_csv(response.text)),
+        ("github-mirror", VPNGATE_MIRROR, lambda response: parse_mirror_json(response.json())),
+        ("previous-pages", SITE_URL + "/data.json", lambda response: parse_previous_json(response.json())),
+    ]
+
+    def fetch_source(name, url, parser):
+        try:
+            log("VPN GATE", f"获取 {name}: {url}")
+            response = requests.get(url, timeout=HTTP_TIMEOUT,
+                                    headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"})
+            response.raise_for_status()
+            rows = parser(response)
+            log("VPN GATE", f"{name}: {len(rows)} 个候选节点")
+            return rows
+        except Exception as exc:
+            log("VPN GATE", f"{name} 获取失败: {exc}")
+            return []
+
+    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+        futures = [pool.submit(fetch_source, *source) for source in sources]
+        fetched = [future.result() for future in futures]
+    rows = [row for batch in fetched for row in batch]
+    if not rows:
+        die("VPN Gate 官方 API、镜像与有效期内的历史候选均不可用 (不生成空结果, 本次运行判定失败)")
+    return rows, "+".join(source[0] for source, batch in zip(sources, fetched) if batch)
 
 
 def parse_csv(text):
@@ -191,7 +194,7 @@ def parse_csv(text):
     rows = []
     for ln in data_lines:
         fields = next(csv.reader(io.StringIO(ln)))
-        if len(fields) < 7:
+        if len(fields) <= max(pos.values()):
             continue
         host = fields[pos["hostname"]].strip()
         ip = fields[pos["ip"]].strip()
@@ -218,8 +221,13 @@ def parse_mirror_json(data):
             servers.append(item)
     rows = []
     for s in servers:
-        host = str(s.get("hostname") or s.get("host") or "").strip()
-        ip = str(s.get("ip") or "").strip()
+        if not isinstance(s, dict):
+            continue
+        host = s.get("hostname") or s.get("host") or ""
+        ip = s.get("ip") or ""
+        if not isinstance(host, str) or not isinstance(ip, str):
+            continue
+        host, ip = host.strip(), ip.strip()
         if not host or not ip:
             continue
         rows.append({
@@ -232,41 +240,99 @@ def parse_mirror_json(data):
     return rows
 
 
+def parse_previous_json(data):
+    """Use at most 512 fresh own Pages addresses as unverified discovery candidates."""
+    if not isinstance(data, dict) or not isinstance(data.get("available"), list):
+        return []
+    try:
+        generated = datetime.strptime(data.get("generated_at", ""), "%Y-%m-%d %H:%M:%S UTC").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return []
+    age = (datetime.now(timezone.utc) - generated).total_seconds()
+    if not 0 <= age <= PREVIOUS_MAX_AGE_SECONDS:
+        return []
+    rows, seen = [], set()
+    for previous in data["available"]:
+        if not isinstance(previous, dict) or previous.get("success") is not True or previous.get("protocol") != "sstp":
+            continue
+        candidate = {"host": previous.get("host"), "ip": previous.get("ip"),
+                     "country_long": previous.get("country"), "country_short": previous.get("country_code"),
+                     "config_b64": "", "sstp_port": previous.get("port")}
+        validated = to_sstp_nodes([candidate])
+        if not validated:
+            continue
+        node = validated[0]
+        key = (node["host"], node["port"])
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(candidate)
+        if len(rows) >= PREVIOUS_MAX_CANDIDATES:
+            break
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # 第 2 步: 筛选 SSTP 节点 (只保留带 TCP 入口的中继)
 # ---------------------------------------------------------------------------
 _PROTO_TCP_RE = re.compile(r"^proto\s+(tcp|tcp4|tcp6)\b", re.M)
 _REMOTE_RE = re.compile(r"^remote\s+\S+\s+(\d+)", re.M)
+_HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.opengw\.net)?", re.I | re.ASCII)
 
 
 def to_sstp_nodes(rows):
-    """把原始行转成 SSTP 节点: 解码 OpenVPN 配置, 仅保留 proto tcp + remote 端口。
-    host 统一为 <short>.opengw.net 形式; 返回去重前的节点列表。"""
+    """Validate candidates, using TCP config or an explicit previous SSTP port.
+    Return only addresses and source geography; historical check evidence is discarded.
+    """
     nodes = []
     for r in rows:
-        cfg = ""
-        if r["config_b64"]:
+        if not isinstance(r, dict):
+            continue
+        host, ip = r.get("host"), r.get("ip")
+        if not isinstance(host, str) or not isinstance(ip, str):
+            continue
+        host, ip = host.strip().lower(), ip.strip()
+        if not _HOST_RE.fullmatch(host):
+            continue
+        try:
+            if not ipaddress.ip_address(ip).is_global:
+                continue
+        except ValueError:
+            continue
+        if "sstp_port" in r:
+            value = r["sstp_port"]
+            if type(value) is int:
+                port = value
+            elif isinstance(value, str) and re.fullmatch(r"[0-9]{1,5}", value):
+                port = int(value)
+            else:
+                continue
+        else:
             try:
-                cfg = base64.b64decode(r["config_b64"], validate=False).decode("utf-8", "replace")
-            except Exception:
-                cfg = ""
-        if not _PROTO_TCP_RE.search(cfg):
-            continue  # 无 TCP 入口 -> 不是 SSTP 可用节点, 丢弃
-        m = _REMOTE_RE.search(cfg)
-        if not m:
+                cfg = base64.b64decode(r.get("config_b64") or "", validate=False).decode("utf-8", "replace")
+            except (ValueError, TypeError):
+                continue
+            if not _PROTO_TCP_RE.search(cfg):
+                continue
+            match = _REMOTE_RE.search(cfg)
+            if not match or len(match.group(1)) > 5:
+                continue
+            port = int(match.group(1))
+        if not 1 <= port <= 65535:
             continue
-        port = int(m.group(1))
-        if not (1 <= port <= 65535):
-            continue
-        host = r["host"]
         if not host.endswith(".opengw.net"):
             host = f"{host}.opengw.net"
+        country = r.get("country_long")
+        code = r.get("country_short")
+        country = country.strip() if isinstance(country, str) else ""
+        code = code.strip().upper() if isinstance(code, str) else ""
+        code = code if re.fullmatch(r"[A-Z]{2}", code) else ""
         nodes.append({
             "host": host,
             "port": port,
-            "ip": r["ip"],
-            "country": r["country_long"],
-            "country_code": r["country_short"],
+            "ip": ip,
+            "country": country,
+            "country_code": code,
         })
     return nodes
 
@@ -416,10 +482,25 @@ def check_all(nodes, session=None):
 # ---------------------------------------------------------------------------
 # 第 4 步: 生成网页数据
 # ---------------------------------------------------------------------------
+def https_latency_key(node):
+    """Order by actual HTTPS chain latency; absent/invalid measurements always come last."""
+    delay = node.get("https_latency_ms")
+    valid = type(delay) in (int, float) and math.isfinite(delay) and delay >= 0
+    return (not valid, delay if valid else 0, node.get("host") or "", node.get("port") or 0)
+
+
 def build_outputs(results, raw_count, sstp_count, source):
-    available = [r for r in results if r.get("success")]
+    available = [dict(r) for r in results if r.get("success") is True]
     countries = {}
     for n in available:
+        exit_info = n.get("exit")
+        if isinstance(exit_info, dict):
+            code = exit_info.get("country_code")
+            code = code.strip().upper() if isinstance(code, str) else ""
+            if re.fullmatch(r"[A-Z]{2}", code):
+                n["country_code"] = code
+                country = exit_info.get("country")
+                n["country"] = country.strip() if isinstance(country, str) and country.strip() else COUNTRY_ZH.get(code, code)
         c = n["country"] or "未知"
         countries.setdefault(c, {"code": n["country_code"] or "?", "nodes": []})["nodes"].append(n)
 
@@ -439,7 +520,7 @@ def build_outputs(results, raw_count, sstp_count, source):
         grp["count"] = len(grp["nodes"])
         grp["residential"] = sum(1 for n in grp["nodes"] if n["residential"] == "residential")
         grp["datacenter"] = sum(1 for n in grp["nodes"] if n["residential"] == "datacenter")
-        grp["nodes"].sort(key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
+        grp["nodes"].sort(key=https_latency_key)
         by_country[name] = grp
 
     data = {
@@ -490,9 +571,7 @@ def build_chains_text(data):
             grp["nodes"],
             key=lambda n: (
                 0 if n.get("residential") == "residential" else 1,
-                n.get("latency_ms") is None,
-                n.get("latency_ms") or 0,
-                n.get("host") or "",
+                *https_latency_key(n),
             ),
         )
         lines.append("")
@@ -552,9 +631,7 @@ def build_hosts_text(data):
             grp["nodes"],
             key=lambda n: (
                 0 if n.get("residential") == "residential" else 1,
-                n.get("latency_ms") is None,
-                n.get("latency_ms") or 0,
-                n.get("host") or "",
+                *https_latency_key(n),
             ),
         )
         lines.append("")
@@ -637,9 +714,7 @@ def build_sub_text(data):
             grp["nodes"],
             key=lambda n: (
                 0 if n.get("residential") == "residential" else 1,
-                n.get("latency_ms") is None,
-                n.get("latency_ms") or 0,
-                n.get("host") or "",
+                *https_latency_key(n),
             ),
         )
         for i, n in enumerate(nodes, 1):
@@ -672,21 +747,28 @@ def get_entry_addresses():
 def build_mihomo_config(data):
     """Strict residential profile plus a renewable provider; no public traffic falls back to DIRECT."""
     nodes = sorted([n for n in data["available"] if n.get("residential") == "residential"],
-                   key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
+                   key=https_latency_key)
     proxies = []
     entries = get_entry_addresses()
     for index, node in enumerate(nodes):
-        proxies.append(build_proxy(node, entries[index % len(entries)]))
+        verified_entry = node.get("entry_address")
+        entry = verified_entry if verified_entry in entries else entries[index % len(entries)]
+        proxies.append(build_proxy(node, entry))
     codes = sorted({n["country_code"] for n in nodes}, key=lambda code: (code != "JP", code))
     groups = []
     for code in codes:
         country = COUNTRY_ZH.get(code) or code
-        groups.append({"name": country + "住宅自动", "type": "fallback", "use": ["住宅节点"],
+        group = {"name": country + "住宅自动", "type": "url-test" if code == "JP" else "fallback", "use": ["住宅节点"],
                        "proxies": ["REJECT"],
                        "filter": "^" + re.escape(country) + "-住宅-", "empty-fallback": "REJECT",
-                       "url": "https://www.gstatic.com/generate_204", "expected-status": 204,
-                       "interval": 180, "timeout": 15000, "max-failed-times": 2,
-                       "lazy": False, "disable-udp": True})
+                       "url": "https://1.1.1.1/", "expected-status": 301,
+                       "interval": 120 if code == "JP" else 180, "timeout": 15000, "max-failed-times": 2,
+                       "lazy": False, "disable-udp": True}
+        if code == "JP":
+            group["tolerance"] = 100
+            groups.append(dict(group, name="日本住宅稳定", type="fallback"))
+            groups[-1].pop("tolerance", None)
+        groups.append(group)
     choices = [g["name"] for g in groups]
     groups.insert(0, {"name": "住宅出口", "type": "select", "proxies": choices or ["REJECT"],
                       "use": ["住宅节点"], "empty-fallback": "REJECT", "disable-udp": True})
@@ -704,8 +786,8 @@ def build_mihomo_config(data):
                 "fallback": [], "use-system-hosts": False, "fake-ip-filter": ["*.lan", "*.local", "localhost"]},
         "proxy-providers": {"住宅节点": {"type": "http", "url": SITE_URL + "/proxies.yaml",
                             "path": "./providers/hjhhh-residential.yaml", "interval": 900, "proxy": "DIRECT",
-                            "health-check": {"enable": True, "url": "https://www.gstatic.com/generate_204",
-                                             "expected-status": 204, "interval": 180, "timeout": 15000, "lazy": False}}},
+                            "health-check": {"enable": True, "url": "https://1.1.1.1/",
+                                             "expected-status": 301, "interval": 120, "timeout": 15000, "lazy": False}}},
         "proxy-groups": groups,
         "rules": ["AND,((NETWORK,UDP),(DST-PORT,443)),REJECT",
                   "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve", "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
@@ -793,7 +875,7 @@ def main():
     uniq = dedupe(sstp_nodes)
 
     if MAX_CHECK_NODES > 0:
-        uniq = uniq[:MAX_CHECK_NODES]
+        uniq = sorted(uniq, key=lambda node: node["country_code"] != "JP")[:MAX_CHECK_NODES]
 
     log("VPN GATE", f"获取原始节点: {raw_count}")
     log("VPN GATE", f"SSTP 节点: {sstp_count}")

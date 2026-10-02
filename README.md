@@ -10,9 +10,19 @@
 
 GitHub Actions 在每小时的 7、22、37、52 分钟计划运行，GitHub 可能延迟任务。每个节点必须连续两次通过自有检查器，返回有效且一致的公共出口 IP，再通过实际 VLESS → Worker → SSTP 链路访问 Google 和 Cloudflare 的 HTTPS 204 页面。HTTPS 证书验证保持开启，HTTP 状态不符、TLS EOF、超时均剔除。这个检测使用 HTTPS HEAD；Cloudflare trace 仅用于另外的 GET 出口验证，不能用作 HEAD 200 检测。
 
-自动订阅每 15 分钟更新节点集合，每 3 分钟做 HTTPS 健康检查，在同国家组内故障切换。选择“住宅出口 → 日本住宅自动”等国家组后，避免跨国家轮换影响登录会话。切换节点仍然会改变出口 IP。全部住宅节点失败时，任务失败并保留上次已部署版本。
+候选节点并发取自官方 HTTPS CSV、GitHub 镜像和本项目上次发布的 `data.json`，按 `host:port` 去重。官方接口成功时仍合并镜像独有的节点；上次结果仅在生成时间不超过 24 小时且字段有效时用于发现地址，最多补充 512 个候选，每个都重新经过两次出口检查和完整 HTTPS 链路验证。设置 `MAX_CHECK_NODES` 限制检测数量时优先日本候选。源地址标注的国家与实测出口不同，以检查器确认的出口国家码分组。
+
+自动订阅每 15 分钟更新节点集合，每 2 分钟做 HTTPS 健康检查。“日本住宅自动”使用 `url-test`，从本机完整链路的健康节点中选择更快的日本住宅出口，延迟差在 100 毫秒内时减少来回切换；其他国家组每 3 分钟检查并故障切换。选择“住宅出口 → 日本住宅自动”等国家组后，避免跨国家轮换影响登录会话。测速和故障切换仍然会改变出口 IP。自动组没有健康节点时使用 REJECT；全部住宅节点未通过发布检测时，任务失败并保留上次已部署版本。
+
+发布节点按实测 `https_latency_ms` 排序，缺失或无效测量排在最后；记录的已验证入口仍在当前入口清单中时，排序后继续使用该入口。检查器的 `latency_ms` 包含出口信息查询时间，不作为完整链路速度的排序依据。本机自动测速结果也可能与 GitHub Actions 不同，以客户端的实际链路为准。
+
+健康检查通过完整代理链路请求 `https://1.1.1.1/`，验证 TLS 证书及 HTTP 301，不跟随跳转。使用 IP 地址省去测速域名的额外 SSTP DNS 建连；此 URL 不用于 DNS 解析器配置。发布前仍必须通过 Google 和 Cloudflare 两个域名的 HTTPS 204 检查，以验证域名解析和实际网站访问。第一条入口失败时再验证第二条入口，发布保留成功的入口。检查器通过 SSTP 访问自有 `/ip.json`，避免第三方 IP 查询接口限流；住宅属性依照 ASN 和中继类型估算，Cloudflare 未提供的隐私/托管标记保持未知。
 
 节点名称绑定 `host:port` 的摘要，排序变化不会把同一个名称映射到另一个出口。传统 `chains.txt`、`hosts.txt`、`sub.txt` 仍会生成；需要自动更新和故障切换时使用完整 Mihomo YAML。
+
+长对话建议选择默认的“日本住宅稳定”：按完整 HTTPS 延迟排序后的候选故障切换，避免仅因另一节点快一点而切换。“日本住宅自动”仍可用于测速选优；故障切换和节点列表更新仍可能改变出口 IP。发布检查另外要求连续两次独立 HTTPS 建连，剔除只偶尔握手成功的线路。
+
+自有检查器的 `EXIT_METADATA_KEY` 必须配置为 Cloudflare Secret；带随机 nonce 的出口响应使用 HMAC-SHA256 认证，并检查签名及 60 秒有效期。密钥只保存在 Worker 环境中。未配置密钥时检查失败，不信任中继返回的未认证地区和运营商信息。
 
 ## Windows / FlClash
 
@@ -20,7 +30,7 @@ GitHub Actions 在每小时的 7、22、37、52 分钟计划运行，GitHub 可�
 
 网站 DNS 通过所选住宅出口访问 Google TCP DNS，失败后不会回退到直连 DNS。DNS 随 VLESS/TLS 和 SSTP 加密到住宅出口，从出口到 Google 使用 TCP53；减少额外 DoH 握手造成的首次查询超时。Worker 收到 SSTP 目标域名或 UDP53 查询时，也通过同一个 SSTP 节点解析。
 
-入口采用实测通过的两条 Cloudflare IPv4，并保留自有 Worker 域名的 TLS SNI 与 Host。此次本机测试中，两条入口的 Cloudflare colo 为 LAX，原自有域名地址的 colo 为 AMS，优化后的隧道内 TCP DNS 用时约 2.3–3.5 秒。Cloudflare Anycast 路由可能变化，此数据不代表长期速度保证。`EDT_ENTRY_IPS` 可覆盖；不设置时使用自有 Worker 域名解析出的 IPv4。
+CI 入口采用实测通过的 `172.64.155.1` 和 `172.64.144.1`，并保留自有 Worker 域名的 TLS SNI 与 Host。此次本机两条入口的 Cloudflare colo 为 SIN，自有域名的 TLS 与 trace 请求分别约 328/406 毫秒；同一组 13 个日本候选的完整链路验证中，新入口通过 8 个、旧入口通过 7 个，冷连接延迟中位数由约 5.41 秒降至 4.18 秒。Cloudflare Anycast 路由可能变化，此数据不代表长期速度保证。`EDT_ENTRY_IPS` 可覆盖；不设置时使用自有 Worker 域名解析出的 IPv4。
 
 直连的加密 bootstrap DNS 用于节点入口或订阅下载域名，不承担网站 DNS。阿里 DNS 使用证书名称 `dns.alidns.com` 校验，未关闭证书验证。订阅下载走 DIRECT，因此本机需要能访问 GitHub Pages。
 
@@ -40,7 +50,8 @@ python -m unittest discover -s tests -v
 node cloudflare/tests/dns.cjs cloudflare/worker.mjs
 node cloudflare/tests/run.mjs
 node cloudflare/tests/subscription.cjs
+node --test cloudflare/tests/checker.cjs
 MIHOMO_BINARY=/absolute/path/to/mihomo python vpngate.py
 ```
 
-CI 下载官方固定版本 Mihomo 并验证归档 SHA256；不设置 `MIHOMO_BINARY` 的本地运行会明确跳过真实 HTTPS 验证。`EDT_DOMAIN`、`EDT_UUID`、`CHECK_WORKER`、`SITE_URL` 可通过环境变量覆盖。
+CI 下载官方固定版本 Mihomo 并验证归档 SHA256；不设置 `MIHOMO_BINARY` 的本地运行会明确跳过真实 HTTPS 验证。`VPNGATE_API`、`VPNGATE_MIRROR`、`EDT_DOMAIN`、`EDT_UUID`、`CHECK_WORKER`、`SITE_URL` 可通过环境变量覆盖；历史候选只读取 `SITE_URL/data.json`。

@@ -35,14 +35,16 @@ jobs:
         run: |
           python -m unittest discover -s tests -v
           node --check cloudflare/worker.mjs
+          node --check cloudflare/checker.mjs
           node cloudflare/tests/dns.cjs cloudflare/worker.mjs
           node cloudflare/tests/run.mjs
           node cloudflare/tests/subscription.cjs
+          node --test cloudflare/tests/checker.cjs
 
       - name: Download pinned official Mihomo for real HTTPS verification
         run: python download_mihomo.py --output "${RUNNER_TEMP}/mihomo"
 
-      - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
+      - name: Merge VPN Gate candidates + verify exit and actual HTTPS chain + build page
         run: python vpngate.py
         env:
           CHECK_WORKER: "https://ch.opopoiovcc.kdns.fr/check?sstp=vpn:vpn@"
@@ -51,7 +53,7 @@ jobs:
           VERIFY_PASSES: "2"
           SITE_URL: "https://mmaniu353-lab.github.io/hjhhh"
           MIHOMO_BINARY: "${{ runner.temp }}/mihomo"
-          EDT_ENTRY_IPS: "104.16.0.1,162.159.192.1"
+          EDT_ENTRY_IPS: "172.64.155.1,172.64.144.1"
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
