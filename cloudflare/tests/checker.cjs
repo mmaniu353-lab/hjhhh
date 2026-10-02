@@ -159,6 +159,23 @@ test('signed metadata must match the request nonce and its fresh timestamp', asy
   }
 });
 
+test('authenticated metadata tolerates one second of Cloudflare clock skew', async () => {
+  const result = await harness(fixture, {
+    beforeSign: value => ({ ...value, issued_at: Date.now() + 1000 }),
+  }).check();
+  assert.equal(result.success, true, result.error);
+  assert.equal(result.exit.ip, fixture.ip);
+});
+
+test('authenticated metadata rejects future clock skew beyond five seconds', async () => {
+  const result = await harness(fixture, {
+    beforeSign: value => ({ ...value, issued_at: Date.now() + 6000 }),
+  }).check();
+  assert.equal(result.success, false);
+  assert.equal(result.exit, undefined);
+  assert.match(result.error, /timestamp|fresh/i);
+});
+
 test('proxy checks fail closed without an exit metadata authentication key', async () => {
   for (const metadataKey of [undefined, null, '', '   ', 123]) {
     const h = harness(fixture, { metadataKey, unsigned: true });

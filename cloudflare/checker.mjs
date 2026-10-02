@@ -244,8 +244,8 @@ async function verifySignedExitMetadata(envelope, nonce, key) {
 	if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) throw new Error('Target /ip.json returned invalid signed metadata');
 	if (envelope.nonce !== nonce) throw new Error('Target /ip.json signed metadata nonce mismatch');
 	const now = Date.now();
-	if (!Number.isFinite(envelope.issued_at) || envelope.issued_at > now || now - envelope.issued_at > 60000) {
-		throw new Error('Target /ip.json signed metadata timestamp is not fresh');
+	if (!Number.isFinite(envelope.issued_at) || envelope.issued_at - now > 5000 || now - envelope.issued_at > 60000) {
+		throw new Error(`Target /ip.json signed metadata timestamp is not fresh (age ${now - envelope.issued_at} ms)`);
 	}
 	if (typeof envelope.signature !== 'string' || !/^[a-f0-9]{64}$/i.test(envelope.signature)) {
 		throw new Error('Target /ip.json signed metadata has an invalid signature');

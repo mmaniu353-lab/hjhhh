@@ -55,36 +55,67 @@ export function remoteTcp(localPort, sequence, flags, payload = new Uint8Array()
   return bytes;
 }
 
-export function loadSection() {
+export const flushTasks = () => new Promise(resolve => setImmediate(resolve));
+
+export function loadSection({ manualTimers = false, localIsn } = {}) {
   const sectionPath = process.env.SSTP_SECTION_PATH || new URL('./section.txt', import.meta.url);
   const section = fs.readFileSync(sectionPath, 'utf8');
   const actualWorker = fs.readFileSync(new URL('../worker.mjs', import.meta.url), 'utf8');
   const timeoutStart = actualWorker.indexOf('async function withTimeout(');
   const timeoutEnd = actualWorker.indexOf('function turnStunPadding(', timeoutStart);
   const nativeStart = Date.now(), virtualStart = nativeStart;
+  let virtualNow = virtualStart;
   const timers = new Set();
   const context = vm.createContext({
-    crypto: webcrypto, Uint8Array, DataView, TextEncoder, TextDecoder, ReadableStream, WritableStream, Promise, Error, Math,
-    Date: class extends Date { static now() { return virtualStart + (Date.now() - nativeStart) * 100; } },
+    crypto: {
+      randomUUID: () => webcrypto.randomUUID(),
+      getRandomValues(bytes) {
+        if (localIsn !== undefined && bytes.byteLength === 4) new DataView(bytes.buffer, bytes.byteOffset, 4).setUint32(0, localIsn);
+        else webcrypto.getRandomValues(bytes);
+        return bytes;
+      }
+    }, Uint8Array, DataView, TextEncoder, TextDecoder, ReadableStream, WritableStream, Promise, Error, Math,
+    Date: class extends Date { static now() { return manualTimers ? virtualNow : virtualStart + (Date.now() - nativeStart) * 100; } },
     textEncoder: new TextEncoder(), textDecoder: new TextDecoder(), CONNECT_TIMEOUT_MS: 9999,
     setTimeout(callback, milliseconds) {
+      if (manualTimers) {
+        const timer = { callback, due: virtualNow + Math.max(0, milliseconds) };
+        timers.add(timer);
+        return timer;
+      }
       let timer;
       timer = setTimeout(() => { timers.delete(timer); callback(); }, Math.max(1, milliseconds / 100));
       timers.add(timer);
       return timer;
     },
-    clearTimeout(timer) { timers.delete(timer); clearTimeout(timer); },
+    clearTimeout(timer) { timers.delete(timer); if (!manualTimers) clearTimeout(timer); },
     '数据转Uint8Array': value => value instanceof Uint8Array ? value : new Uint8Array(value),
     '拼接字节数据': concat,
     stripIPv6Brackets: value => value.replace(/^\[|\]$/g, ''),
   });
   const connect = vm.runInContext(actualWorker.slice(timeoutStart, timeoutEnd) + section + '\nsstpConnect;', context);
-  return { connect, timers, cleanup() { for (const timer of timers) clearTimeout(timer); timers.clear(); } };
+  return { connect, timers, async advance(milliseconds) {
+    assert.ok(manualTimers, 'advance requires manualTimers');
+    const target = virtualNow + milliseconds;
+    await flushTasks();
+    for (;;) {
+      const next = [...timers].filter(timer => timer.due <= target).sort((left, right) => left.due - right.due)[0];
+      if (!next) break;
+      virtualNow = next.due;
+      timers.delete(next);
+      next.callback();
+      await flushTasks();
+    }
+    virtualNow = target;
+    await flushTasks();
+  }, cleanup() { if (!manualTimers) for (const timer of timers) clearTimeout(timer); timers.clear(); } };
 }
 
-export function socketMock({ stageEcho = '', dropInitialSyn = false, remoteIsn = 1000, setupTerminate = false, malformedSynAck = false } = {}) {
+export function socketMock({ stageEcho = '', dropInitialSyn = false, remoteIsn = 1000, setupTerminate = false, malformedSynAck = false, peerWindow = 65535, autoAckData = false, dropDataSegments = [], dropDataAcks = [], autoEcho = false, stallDataWrites = false, failDataWrites = false, failEchoWrites = false } = {}) {
   let streamController, ended = false, sourcePort, localSequence, ipcpNakSent = false, closingCalls = 0;
   const writes = [], tcpWrites = [], linkWrites = [];
+  let expectedSequence, dataSegments = 0, dataAcks = 0, receivedBytes = new Uint8Array();
+  const receivedRanges = [];
   const metrics = { activeReads: 0, maxActiveReads: 0 };
   const push = bytes => { if (!ended) streamController.enqueue(bytes); };
   const echoFrames = () => concat(control(8), ppp(0xc021, 9, 99, new Uint8Array([1, 2, 3, 4, 65, 66])));
@@ -113,14 +144,35 @@ export function socketMock({ stageEcho = '', dropInitialSyn = false, remoteIsn =
       const length = ((chunk[offset + 2] << 8) | chunk[offset + 3]) & 4095;
       assert.ok(length >= 4);
       const frame = chunk.subarray(offset, offset + length);
-      if (frame[1] & 1) linkWrites.push({ type: (frame[4] << 8) | frame[5], frame: new Uint8Array(frame) });
+      if (frame[1] & 1) {
+        const type = (frame[4] << 8) | frame[5];
+        linkWrites.push({ type, frame: new Uint8Array(frame) });
+        if (type === 8 && failEchoWrites) throw new Error('mock echo write failed');
+        if (type === 8 && autoEcho) push(control(9));
+      }
       else if (frame[6] === 0 && frame[7] === 33) {
         const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
         sourcePort = view.getUint16(28); localSequence = view.getUint32(32);
-        const record = { sequence: localSequence, ack: view.getUint32(36), flags: frame[41], payload: decode(frame.subarray(48)) };
+        const record = { sequence: localSequence, ack: view.getUint32(36), flags: frame[41], payload: decode(frame.subarray(48)), bytes: new Uint8Array(frame.subarray(48)) };
         tcpWrites.push(record);
+        if (record.bytes.byteLength && failDataWrites) throw new Error('mock data write failed');
+        if (record.bytes.byteLength && stallDataWrites) return new Promise(() => {});
         if (record.flags === 2 && (!dropInitialSyn || tcpWrites.filter(item => item.flags === 2).length > 1)) {
-          push(concat(...(stageEcho === 'tcp' ? [echoFrames()] : []), remoteTcp(sourcePort, remoteIsn, 0x12, new Uint8Array(), (localSequence + (malformedSynAck ? 2 : 1)) >>> 0)));
+          expectedSequence = (localSequence + 1) >>> 0;
+          push(concat(...(stageEcho === 'tcp' ? [echoFrames()] : []), remoteTcp(sourcePort, remoteIsn, 0x12, new Uint8Array(), (localSequence + (malformedSynAck ? 2 : 1)) >>> 0, peerWindow)));
+        }
+        if (record.bytes.byteLength && autoAckData && !dropDataSegments.includes(++dataSegments)) {
+          receivedRanges.push({ sequence: record.sequence, bytes: record.bytes });
+          receivedRanges.sort((left, right) => ((left.sequence - expectedSequence) | 0) - ((right.sequence - expectedSequence) | 0));
+          while (receivedRanges.length && ((receivedRanges[0].sequence - expectedSequence) | 0) <= 0) {
+            const range = receivedRanges.shift();
+            const skip = (expectedSequence - range.sequence) >>> 0;
+            if (skip >= range.bytes.byteLength) continue;
+            const bytes = range.bytes.subarray(skip);
+            receivedBytes = concat(receivedBytes, bytes);
+            expectedSequence = (expectedSequence + bytes.byteLength) >>> 0;
+          }
+          if (!dropDataAcks.includes(++dataAcks)) push(remoteTcp(sourcePort, (remoteIsn + 1) >>> 0, 0x10, new Uint8Array(), expectedSequence, peerWindow));
         }
       } else {
         const protocol = (frame[6] << 8) | frame[7];
@@ -140,11 +192,11 @@ export function socketMock({ stageEcho = '', dropInitialSyn = false, remoteIsn =
     if (!ended) { ended = true; try { streamController.close(); } catch {} }
     return Promise.resolve();
   } };
-  return { socket, push, writes, tcpWrites, linkWrites, metrics, get sourcePort() { return sourcePort; }, get localSequence() { return localSequence; }, get closingCalls() { return closingCalls; } };
+  return { socket, push, writes, tcpWrites, linkWrites, metrics, get receivedBytes() { return receivedBytes; }, get sourcePort() { return sourcePort; }, get localSequence() { return localSequence; }, get closingCalls() { return closingCalls; } };
 }
 
 export async function fixture(options = {}) {
-  const runtime = loadSection();
+  const runtime = loadSection(options);
   const mock = socketMock(options);
   let conn;
   try { conn = await runtime.connect({ hostname: 'mock.invalid', port: 443, username: 'vpn', password: 'vpn' }, '203.0.113.1', 443, () => mock.socket); }

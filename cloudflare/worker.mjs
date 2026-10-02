@@ -4475,6 +4475,10 @@ async function forwardSstpUdpDns(chunk, webSocket, respHeader, request, wrapResp
 const SSTP_TCP_MSS = 1400;
 const SSTP_TCP_RECEIVE_WINDOW = 65535;
 const SSTP_TCP_MAX_RECEIVE_RANGES = 256;
+const SSTP_TCP_SEND_WINDOW = 65535;
+const SSTP_TCP_MAX_DATA_RETRIES = 4;
+const SSTP_TCP_SEND_TIMEOUT_MS = 30000;
+const SSTP_LINK_ECHO_INTERVAL_MS = 20000;
 const SSTP_EMPTY_BYTES = new Uint8Array(0);
 
 function readSstpUint16(bytes, offset = 0) {
@@ -4501,6 +4505,10 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 	proxy = { ...proxy, username: proxy.username ?? null, password: proxy.password ?? null };
 	let bufferedBytes = SSTP_EMPTY_BYTES, pppIdentifier = 1, socket = null, reader = null, writer = null;
 	let closedSettled = false, closing = false, resolveClosed, rejectClosed;
+	/** @type {ReadableStreamDefaultController<Uint8Array> | null} */
+	let streamController = null;
+	let writableController = null, connectionError = null, cleanupTransport = () => { };
+	const pendingWriteCancellations = new Set();
 	const closed = new Promise((resolve, reject) => {
 		resolveClosed = resolve;
 		rejectClosed = reject;
@@ -4510,15 +4518,24 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 		closedSettled = true;
 		settle(value);
 	};
-	const close = () => {
+	const close = (error = null) => {
 		if (closing) return;
 		closing = true;
+		connectionError = error || new Error('SSTP connection closed');
+		cleanupTransport();
+		for (const reject of pendingWriteCancellations) reject(connectionError);
+		pendingWriteCancellations.clear();
+		if (streamController) {
+			try { error ? streamController.error(error) : streamController.close() } catch (e) { }
+			streamController = null;
+		}
+		try { writableController?.error(connectionError) } catch (e) { }
 		try { reader?.cancel?.().catch?.(() => { }) } catch (e) { }
 		try { reader?.releaseLock?.() } catch (e) { }
 		try { writer?.close?.().catch?.(() => { }) } catch (e) { }
 		try { writer?.releaseLock?.() } catch (e) { }
 		try { socket?.close?.().catch?.(() => { }) } catch (e) { }
-		settleClosed(resolveClosed);
+		settleClosed(error ? rejectClosed : resolveClosed, error);
 	};
 
 	const readSocketChunk = async () => {
@@ -4598,7 +4615,13 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 		}
 		return options;
 	};
-	const writeLinkPacket = packet => withTimeout(writer.write(packet), CONNECT_TIMEOUT_MS, 'SSTP control write timed out');
+	const writeLinkPacket = async (packet, message = 'SSTP control write timed out') => {
+		if (closing) throw connectionError;
+		let cancel;
+		const cancelled = new Promise((_, reject) => { cancel = reject; pendingWriteCancellations.add(reject); });
+		try { return await withTimeout(Promise.race([writer.write(packet), cancelled]), CONNECT_TIMEOUT_MS, message) }
+		finally { pendingWriteCancellations.delete(cancel) }
+	};
 	const buildLinkControlPacket = messageType => {
 		const packet = new Uint8Array([0x10, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00]);
 		new DataView(packet.buffer).setUint16(4, messageType);
@@ -4782,6 +4805,7 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 		const destinationAddress = new Uint8Array(String(targetIp || '').split('.').map(Number));
 		let sequenceNumber = readSstpUint32(crypto.getRandomValues(new Uint8Array(4)));
 		let acknowledgementNumber = 0;
+		let peerReceiveWindow = 0, windowSequence = 0, windowAcknowledgement = 0;
 		const ipHeaderTemplate = new Uint8Array(20);
 		ipHeaderTemplate.set([0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 64, 6]);
 		ipHeaderTemplate.set(sourceAddress, 12);
@@ -4790,7 +4814,7 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 		tcpPseudoHeader.set(sourceAddress);
 		tcpPseudoHeader.set(destinationAddress, 4);
 		tcpPseudoHeader[9] = 6;
-		const buildTcpFrame = (flags, payload = SSTP_EMPTY_BYTES) => {
+		const buildTcpFrame = (flags, payload = SSTP_EMPTY_BYTES, sequence = sequenceNumber) => {
 			const bytes = 数据转Uint8Array(payload);
 			const payloadLength = bytes.byteLength;
 			const tcpLength = 20 + payloadLength;
@@ -4805,7 +4829,7 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 			view.setUint16(18, internetChecksum(frame, 8, 20));
 			view.setUint16(28, sourcePort);
 			view.setUint16(30, targetPort);
-			view.setUint32(32, sequenceNumber);
+			view.setUint32(32, sequence);
 			view.setUint32(36, acknowledgementNumber);
 			frame[40] = 0x50;
 			frame[41] = flags;
@@ -4834,6 +4858,7 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 				flags: ipPacket[ipHeaderLength + 13],
 				sequence: readSstpUint32(ipPacket, ipHeaderLength + 4),
 				acknowledgement: readSstpUint32(ipPacket, ipHeaderLength + 8),
+				window: readSstpUint16(ipPacket, ipHeaderLength + 14),
 				payloadOffset: ipHeaderLength + tcpHeaderLength,
 				payloadEnd: totalLength
 			};
@@ -4878,11 +4903,109 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 			if (!tcp || (tcp.flags & 0x12) !== 0x12) continue;
 			if (tcp.acknowledgement !== sequenceNumber) continue;
 			acknowledgementNumber = (tcp.sequence + 1) >>> 0;
+			peerReceiveWindow = tcp.window;
+			windowSequence = tcp.sequence;
+			windowAcknowledgement = tcp.acknowledgement;
 			await withTimeout(writer.write(buildTcpFrame(0x10)), CONNECT_TIMEOUT_MS, 'SSTP TCP ACK write timed out');
 			tcpReady = true;
 			break;
 		}
 		if (!tcpReady) throw new Error('TCP handshake through SSTP timed out');
+		// Retain only unacknowledged bytes. Signed distances are safe within this
+		// bounded window, including when the 32-bit TCP sequence wraps.
+		let sendAcknowledged = sequenceNumber, pendingSegments = [], pendingSendBytes = 0;
+		let retryTimer = null, echoTimer = null, retryRunning = false, retryCount = 0, retryInterval = 1000, sendProgress = 0;
+		const sendWaiters = new Set();
+		const wakeSenders = () => {
+			for (const resolve of sendWaiters) resolve();
+			sendWaiters.clear();
+		};
+		cleanupTransport = () => {
+			clearTimeout(retryTimer);
+			clearTimeout(echoTimer);
+			retryTimer = echoTimer = null;
+			pendingSegments = [];
+			pendingSendBytes = 0;
+			wakeSenders();
+		};
+		const waitForSendProgress = async () => {
+			let wake;
+			const progress = new Promise(resolve => { wake = resolve; sendWaiters.add(resolve); });
+			try { await withTimeout(progress, SSTP_TCP_SEND_TIMEOUT_MS, 'SSTP TCP send window timed out') }
+			finally { sendWaiters.delete(wake) }
+			if (closing) throw connectionError;
+		};
+		const availableSendBytes = () => Math.max(0, Math.min(SSTP_TCP_SEND_WINDOW - pendingSendBytes, peerReceiveWindow - ((sequenceNumber - sendAcknowledged) >>> 0)));
+		const armDataRetry = () => {
+			if (closing || retryRunning || retryTimer !== null || !pendingSegments.length) return;
+			retryTimer = setTimeout(async () => {
+				retryTimer = null;
+				if (closing || !pendingSegments.length) return;
+				if (retryCount >= SSTP_TCP_MAX_DATA_RETRIES) { close(new Error('SSTP TCP data ACK timed out after retransmissions')); return; }
+				retryRunning = true;
+				const progress = sendProgress;
+				retryCount++;
+				try {
+					const frames = [];
+					for (const segment of pendingSegments) {
+						const available = peerReceiveWindow - ((segment.sequence - sendAcknowledged) >>> 0);
+						if (available <= 0) break;
+						frames.push(buildTcpFrame(0x18, segment.payload.subarray(0, available), segment.sequence));
+					}
+					if (frames.length) await writeLinkPacket(拼接字节数据(...frames), 'SSTP TCP data retry write timed out');
+					if (progress === sendProgress) retryInterval = Math.min(retryInterval * 2, 8000);
+				} catch (error) { close(error) }
+				finally { retryRunning = false; armDataRetry() }
+			}, retryInterval);
+		};
+		const acceptAcknowledgement = incoming => {
+			if (!(incoming.flags & 0x10)) return;
+			const receiveDistance = (incoming.sequence - acknowledgementNumber) | 0;
+			if (receiveDistance < 0 || receiveDistance >= SSTP_TCP_RECEIVE_WINDOW) return;
+			const advance = (incoming.acknowledgement - sendAcknowledged) | 0;
+			const outstanding = (sequenceNumber - sendAcknowledged) >>> 0;
+			if (advance < 0 || advance > outstanding) return;
+			const previousAvailable = availableSendBytes();
+			if (advance > 0) {
+				sendAcknowledged = incoming.acknowledgement;
+				while (pendingSegments.length) {
+					const segment = pendingSegments[0];
+					const acknowledgedBytes = (sendAcknowledged - segment.sequence) | 0;
+					if (acknowledgedBytes <= 0) break;
+					const count = Math.min(acknowledgedBytes, segment.payload.byteLength);
+					pendingSendBytes -= count;
+					if (count === segment.payload.byteLength) pendingSegments.shift();
+					else {
+						segment.sequence = (segment.sequence + count) >>> 0;
+						segment.payload = new Uint8Array(segment.payload.subarray(count));
+						break;
+					}
+				}
+				sendProgress++;
+				retryCount = 0;
+				retryInterval = 1000;
+				clearTimeout(retryTimer);
+				retryTimer = null;
+				armDataRetry();
+			}
+			// Ignore reordered window advertisements, even when their ACK is valid.
+			const windowDistance = (incoming.sequence - windowSequence) | 0;
+			if (windowDistance > 0 || (windowDistance === 0 && ((incoming.acknowledgement - windowAcknowledgement) | 0) >= 0)) {
+				peerReceiveWindow = incoming.window;
+				windowSequence = incoming.sequence;
+				windowAcknowledgement = incoming.acknowledgement;
+			}
+			if (advance > 0 || availableSendBytes() > previousAvailable) wakeSenders();
+		};
+		const armLinkEcho = () => {
+			if (closing) return;
+			echoTimer = setTimeout(async () => {
+				echoTimer = null;
+				if (closing) return;
+				try { await writeLinkPacket(buildLinkControlPacket(0x0008)); armLinkEcho() }
+				catch (error) { close(error) }
+			}, SSTP_LINK_ECHO_INTERVAL_MS);
+		};
 		let localFinSent = false;
 		const sendLocalFin = () => {
 			const frame = buildTcpFrame(localFinSent ? 0x10 : 0x11);
@@ -4891,8 +5014,6 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 			return writeLinkPacket(frame);
 		};
 
-		/** @type {ReadableStreamDefaultController<Uint8Array> | null} */
-		let streamController = null;
 		const readable = new ReadableStream({
 			start(controller) {
 				streamController = controller;
@@ -4962,6 +5083,7 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 						continue;
 					}
 					if (incoming.flags & 0x02) { await writeLinkPacket(buildTcpFrame(0x10)); continue; }
+					acceptAcknowledgement(incoming);
 					const payload = ppp.ipPacket.subarray(incoming.payloadOffset, incoming.payloadEnd);
 					if (incoming.flags & 0x01) {
 						const finSequence = (incoming.sequence + payload.byteLength) >>> 0;
@@ -4984,39 +5106,52 @@ async function sstpConnect(proxy, targetHost, targetPort, TCP连接) {
 					if (bufferedBytes.byteLength < 4 || pendingLength >= 32768) flush();
 					if (payload.byteLength || (incoming.flags & 0x01)) await writeLinkPacket(buildTcpFrame(0x10));
 				}
-			} catch (error) {
-				const controller = streamController;
-				if (controller) {
-					try { controller.error(error) } catch (e) { }
-				}
-				settleClosed(rejectClosed, error);
-				close();
-			}
+			} catch (error) { close(error) }
 		})();
+		armLinkEcho();
 
 		const writable = new WritableStream({
-			async write(chunk) {
-				const bytes = 数据转Uint8Array(chunk);
-				if (!bytes.byteLength) return;
-				if (bytes.byteLength <= SSTP_TCP_MSS) {
-					await writer.write(buildTcpFrame(0x18, bytes));
-					sequenceNumber = (sequenceNumber + bytes.byteLength) >>> 0;
-					return;
-				}
-				const frames = [];
-				for (let offset = 0; offset < bytes.byteLength; offset += SSTP_TCP_MSS) {
-					const segment = bytes.subarray(offset, Math.min(offset + SSTP_TCP_MSS, bytes.byteLength));
-					frames.push(buildTcpFrame(0x18, segment));
-					sequenceNumber = (sequenceNumber + segment.byteLength) >>> 0;
-				}
-				await writer.write(拼接字节数据(...frames));
+			start(controller) {
+				writableController = controller;
+				// Sink abort is otherwise deferred until an in-flight write finishes.
+				controller.signal?.addEventListener('abort', () => {
+					const reason = controller.signal.reason || new Error('SSTP write aborted');
+					// Let the stream finish changing its abort state before erroring it.
+					Promise.resolve().then(() => close(reason));
+				}, { once: true });
 			},
-			close() {
+			async write(chunk) {
+				try {
+					const bytes = 数据转Uint8Array(chunk);
+					for (let offset = 0; offset < bytes.byteLength;) {
+						if (closing) throw connectionError;
+						let available = availableSendBytes();
+						if (!available) { await waitForSendProgress(); continue; }
+						const frames = [];
+						while (available > 0 && offset < bytes.byteLength) {
+							const length = Math.min(SSTP_TCP_MSS, available, bytes.byteLength - offset);
+							const payload = new Uint8Array(bytes.subarray(offset, offset + length));
+							const segment = { sequence: sequenceNumber, payload };
+							frames.push(buildTcpFrame(0x18, payload, segment.sequence));
+							pendingSegments.push(segment);
+							pendingSendBytes += length;
+							sequenceNumber = (sequenceNumber + length) >>> 0;
+							offset += length;
+							available -= length;
+						}
+						await writeLinkPacket(拼接字节数据(...frames), 'SSTP TCP data write timed out');
+						armDataRetry();
+					}
+				} catch (error) { close(error); throw error }
+			},
+			async close() {
+				try { while (pendingSegments.length && !closing) await waitForSendProgress() }
+				catch (error) { close(error); throw error }
+				if (closing) throw connectionError;
 				return sendLocalFin();
 			},
 			abort(error) {
-				if (error) settleClosed(rejectClosed, error);
-				close();
+				close(error);
 			}
 		});
 
