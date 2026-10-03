@@ -6,6 +6,8 @@
 
 原 Worker 的 `/sub?token=自己的订阅令牌` 地址也支持修复后的完整配置：FlClash/Mihomo/Clash 的请求直接返回上述 YAML，浏览器下载时添加 `&target=clash`。沿用原来的令牌鉴权；令牌不会发送给 GitHub，也不要提交到仓库。修复配置不可用时返回 503，客户端保留现有配置，不回退到旧的 DNS 模板。订阅响应的更新提示为 1 小时，配置内的节点集合仍每 15 分钟更新。
 
+日本入口加速配置使用 `/sub?token=自己的订阅令牌&target=clash&profile=japan-relay`。完整配置存放在 Worker 已绑定 KV 的 `subscription-japan-relay.json`，只接受原用户订阅令牌，转换后端令牌不能读取；未配置时返回 503。v2rayN 在订阅分组中填写这个 URL 并更新订阅，会识别为 Mihomo 自定义配置。配置可包含个人已有入口订阅和节点凭据，因此 KV 内容不提交到公共仓库。日本入口和住宅节点通过配置内的 providers 分别更新。
+
 ## 检测与自动切换
 
 GitHub Actions 在每小时的 7、22、37、52 分钟计划运行，GitHub 可能延迟任务。每个节点必须连续两次通过自有检查器，返回有效且一致的公共出口 IP，再通过实际 VLESS → Worker → SSTP 链路访问 Google 和 Cloudflare 的 HTTPS 204 页面。HTTPS 证书验证保持开启，HTTP 状态不符、TLS EOF、超时均剔除。这个检测使用 HTTPS HEAD；Cloudflare trace 仅用于另外的 GET 出口验证，不能用作 HEAD 200 检测。

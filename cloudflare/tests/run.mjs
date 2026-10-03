@@ -10,7 +10,9 @@ const state = new URL('../../.test-state/', import.meta.url);
 fs.mkdirSync(state, { recursive: true });
 const section = new URL('section.txt', state);
 fs.writeFileSync(section, source.slice(start, end));
-const result = spawnSync(process.execPath, ['--test', '--test-concurrency=1', fileURLToPath(new URL('./sstp.mjs', import.meta.url))], {
+const result = spawnSync(process.execPath, ['--test', '--test-concurrency=1',
+  fileURLToPath(new URL('./sstp.mjs', import.meta.url)),
+  fileURLToPath(new URL('./subscription-profile.mjs', import.meta.url))], {
   encoding: 'utf8', env: { ...process.env, SSTP_SECTION_PATH: fileURLToPath(section) }
 });
 process.stdout.write(`${result.stdout || ''}${result.stderr || ''}`);

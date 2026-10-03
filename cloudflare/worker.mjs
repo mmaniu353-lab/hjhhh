@@ -305,6 +305,17 @@ export default {
 					const 订阅TOKEN = await MD5MD5(host + userID), 作为优选订阅生成器 = ['1', 'true'].includes(env.BEST_SUB) && url.searchParams.get('host') === 'example.com' && url.searchParams.get('uuid') === '00000000-0000-4000-8000-000000000000' && UA.toLowerCase().includes('tunnel (https://github.com/' + 特征码字典[1] + '/edge');
 					const 请求TOKEN = url.searchParams.get('token');
 					const 用户客户端请求订阅 = 请求TOKEN === 订阅TOKEN;
+					if (url.searchParams.get('profile') === 'japan-relay') {
+						if (!用户客户端请求订阅) return new Response('Forbidden', { status: 403, headers: { 'Cache-Control': 'private, no-store' } });
+						const profile = await env.KV.get('subscription-japan-relay.json');
+						if (!profile) return new Response('Configuration unavailable', { status: 503, headers: { 'Cache-Control': 'private, no-store' } });
+						return new Response(profile, { headers: {
+							'Content-Type': 'application/json; charset=utf-8',
+							'Cache-Control': 'private, no-store',
+							'Profile-Update-Interval': '24',
+							'Content-Disposition': 'attachment; filename="residential-japan-relay.json"'
+						} });
+					}
 					const 当前日序号 = Math.floor(Date.now() / 86400000);
 					const 订阅转换后端TOKEN种子 = base64SecretEncode(订阅TOKEN, userID);
 					const [今日订阅转换后端专属TOKEN, 昨日订阅转换后端专属TOKEN] = await Promise.all([
