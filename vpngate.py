@@ -30,7 +30,7 @@ import os
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -59,6 +59,7 @@ VPNGATE_MIRROR = os.environ.get(
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://ch.opopoiovcc.kdns.fr/check?sstp=vpn:vpn@")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "8")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "45"))
+CHECK_STAGE_BUDGET_SECONDS = float(os.environ.get("CHECK_STAGE_BUDGET_SECONDS", "0"))
 VERIFY_PASSES = max(1, int(os.environ.get("VERIFY_PASSES", "2")))
 SITE_URL = os.environ.get("SITE_URL", "https://mmaniu353-lab.github.io/hjhhh").rstrip("/")
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
@@ -379,7 +380,18 @@ def classify_network(host, exit_org, is_datacenter=None):
     return "unknown"
 
 
-def check_one(node, session):
+def check_budget_failure(node, verification_passes=0, check_attempted=False):
+    """A missing or partial current check never inherits historical success."""
+    out = dict(node, success=False, status="failed", verification_passes=verification_passes,
+               error="Worker check stage budget exhausted", exit=None, residential="unknown",
+               check_attempted=check_attempted)
+    for field in ("latency_ms", "colo", "worker_error", "https_checks", "stability_tls_checks",
+                  "https_latency_ms", "entry_address"):
+        out.pop(field, None)
+    return out
+
+
+def check_one(node, session, deadline=None):
     """调用 Worker 检测单节点。返回节点+检测结果的合并 dict。
     单节点失败 (网络错误/非 200/坏 JSON) 不会抛出, 统一记 success=False。"""
     url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
@@ -388,11 +400,21 @@ def check_one(node, session):
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
     out["status"] = "failed"
     out["success"] = False
+    out["check_attempted"] = False
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
     out["residential"] = "unknown"
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        request_timeout = CHECK_TIMEOUT
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return check_budget_failure(node)
+            connect_timeout = min(CHECK_TIMEOUT, 5, remaining / 4)
+            request_timeout = (connect_timeout, min(CHECK_TIMEOUT, remaining - connect_timeout))
+        out["check_attempted"] = True
+        r = session.get(url, timeout=request_timeout, allow_redirects=deadline is None,
+                        headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
         if r.status_code != 200:
             out["error"] = f"HTTP {r.status_code}"
             out["worker_error"] = True
@@ -432,6 +454,8 @@ def check_one(node, session):
             out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
         else:
             out["residential"] = classify_network(out["host"], None, None)
+        if deadline is not None and time.monotonic() >= deadline:
+            return check_budget_failure(node, check_attempted=True)
         out["success"] = True
         out["status"] = "success"
         return out
@@ -443,12 +467,16 @@ def check_one(node, session):
         return out
 
 
-def check_stable_node(node):
+def check_stable_node(node, deadline=None):
     """Each node owns its HTTP session; only consecutive passes with a stable exit qualify."""
     checks = []
+    attempted = False
     with requests.Session() as session:
         for _ in range(VERIFY_PASSES):
-            result = check_one(node, session)
+            if deadline is not None and time.monotonic() >= deadline:
+                return check_budget_failure(node, len(checks), check_attempted=attempted)
+            result = check_one(node, session, deadline=deadline)
+            attempted = attempted or result.get("check_attempted", True) is not False
             result["verification_passes"] = len(checks)
             if not result.get("success"):
                 return result
@@ -460,6 +488,8 @@ def check_stable_node(node):
             if checks and (checks[0].get("exit") or {}).get("ip") != (result.get("exit") or {}).get("ip"):
                 result.update(success=False, status="failed", error="Exit IP changed during consecutive checks")
                 return result
+            if deadline is not None and time.monotonic() >= deadline:
+                return check_budget_failure(node, len(checks), check_attempted=attempted)
             checks.append(result)
     result = checks[-1]
     result["verification_passes"] = len(checks)
@@ -471,11 +501,34 @@ def check_stable_node(node):
 
 def check_all(nodes, session=None):
     """Check candidates with separate sessions and require repeated successful connections."""
+    if not math.isfinite(CHECK_STAGE_BUDGET_SECONDS) or CHECK_STAGE_BUDGET_SECONDS < 0:
+        raise ValueError("CHECK_STAGE_BUDGET_SECONDS must be finite and non-negative")
+    deadline = time.monotonic() + CHECK_STAGE_BUDGET_SECONDS if CHECK_STAGE_BUDGET_SECONDS else None
     results = []
+    next_index = 0
+    pending = {}
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_stable_node, n) for n in nodes]
-        for fut in as_completed(futures):
-            results.append(fut.result())
+        while pending or next_index < len(nodes):
+            while len(pending) < CONCURRENCY and next_index < len(nodes):
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+                pending[pool.submit(check_stable_node, nodes[next_index], deadline=deadline)] = next_index
+                next_index += 1
+            if not pending:
+                break
+            timeout = None if deadline is None else max(0, deadline - time.monotonic())
+            done, _ = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+            if not done:
+                break
+            for future in done:
+                pending.pop(future)
+                results.append(future.result())
+        # Only in-flight requests remain; their connect/read timeouts and further
+        # exit checks share this deadline. No full-candidate backlog is waiting.
+    results.extend(future.result() for future in pending)
+    results.extend(check_budget_failure(node) for node in nodes[next_index:])
+    if deadline is not None and time.monotonic() >= deadline:
+        log("CLOUDFLARE WORKER", "检测阶段预算耗尽；未完成连续出口验证的候选不进入可用池")
     return results
 
 
@@ -490,7 +543,8 @@ def https_latency_key(node):
 
 
 def build_outputs(results, raw_count, sstp_count, source):
-    available = [dict(r) for r in results if r.get("success") is True]
+    attempted = [r for r in results if r.get("check_attempted", True) is not False]
+    available = [dict(r) for r in attempted if r.get("success") is True]
     countries = {}
     for n in available:
         exit_info = n.get("exit")
@@ -507,9 +561,11 @@ def build_outputs(results, raw_count, sstp_count, source):
     stats = {
         "raw_nodes": raw_count,
         "sstp_nodes": sstp_count,
-        "checked": len(results),
+        "candidates": len(results),
+        "checked": len(attempted),
+        "budget_skipped": len(results) - len(attempted),
         "success": len(available),
-        "failed": len(results) - len(available),
+        "failed": len(attempted) - len(available),
         "countries": len(countries),
         "residential_est": sum(1 for n in available if n["residential"] == "residential"),
         "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),

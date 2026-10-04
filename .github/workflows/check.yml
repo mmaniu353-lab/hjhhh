@@ -18,7 +18,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,7 +50,10 @@ jobs:
           CHECK_WORKER: "https://ch.opopoiovcc.kdns.fr/check?sstp=vpn:vpn@"
           CHECK_CONCURRENCY: "8"
           CHECK_TIMEOUT: "45"
+          CHECK_STAGE_BUDGET_SECONDS: "900"
           VERIFY_PASSES: "2"
+          HTTPS_CHECK_CONCURRENCY: "8"
+          HTTPS_STAGE_BUDGET_SECONDS: "900"
           SITE_URL: "https://mmaniu353-lab.github.io/hjhhh"
           MIHOMO_BINARY: "${{ runner.temp }}/mihomo"
           EDT_ENTRY_IPS: "172.64.155.1,172.64.144.1"

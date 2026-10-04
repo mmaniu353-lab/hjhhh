@@ -1,5 +1,10 @@
 import copy
 import importlib.util
+import inspect
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import unittest
 from unittest.mock import Mock, patch
@@ -165,5 +170,196 @@ class PipelineTests(unittest.TestCase):
                 data=gate.build_outputs([dict(node(),entry_address=entry)],1,1,'fixture')
                 _,pool=gate.build_mihomo_config(data)
                 self.assertEqual(pool['proxies'][0]['server'],'104.21.50.169')
+
+class WorkerBudgetTests(unittest.TestCase):
+    def test_expired_worker_budget_never_requests_or_inherits_success(self):
+        self.assertIn('deadline',inspect.signature(gate.check_one).parameters)
+        session=Mock()
+        with patch.object(gate.time,'monotonic',return_value=5):
+            result=gate.check_one(dict(node(),check_attempted=True),session,deadline=5)
+        self.assertFalse(result['success'])
+        self.assertIn('budget',result['error'])
+        session.get.assert_not_called()
+        self.assertIs(result.get('check_attempted'),False)
+
+    def test_one_exit_check_before_budget_expiry_is_not_stable_success(self):
+        self.assertIn('deadline',inspect.signature(gate.check_stable_node).parameters)
+        clock=[0.0]
+        def first(*args,**kwargs):
+            clock[0]=5.0
+            return node()
+        with patch.object(gate.time,'monotonic',side_effect=lambda:clock[0]), \
+             patch.object(gate,'VERIFY_PASSES',2), \
+             patch.object(gate,'check_one',side_effect=first) as check:
+            result=gate.check_stable_node(node(),deadline=5)
+        self.assertFalse(result['success'])
+        self.assertEqual(check.call_count,1)
+        self.assertLess(result['verification_passes'],2)
+        self.assertIs(result.get('check_attempted'),True)
+
+    def test_late_valid_exit_response_does_not_qualify(self):
+        self.assertIn('deadline',inspect.signature(gate.check_one).parameters)
+        clock=[0.0]
+        response=Mock(status_code=200)
+        response.json.return_value={'success':True,'exit':{'ip':'8.8.8.8','is_datacenter':False,'asn':{'org':'KDDI'}}}
+        session=Mock()
+        def request(*args,**kwargs):
+            clock[0]=5.0
+            return response
+        session.get.side_effect=request
+        with patch.object(gate.time,'monotonic',side_effect=lambda:clock[0]):
+            result=gate.check_one(node(),session,deadline=5)
+        self.assertFalse(result['success'])
+
+    def test_worker_connect_and_read_timeouts_fit_remaining_budget(self):
+        self.assertIn('deadline',inspect.signature(gate.check_one).parameters)
+        session=Mock()
+        session.get.return_value.status_code=503
+        with patch.object(gate.time,'monotonic',return_value=4):
+            gate.check_one(node(),session,deadline=5)
+        timeout=session.get.call_args.kwargs['timeout']
+        self.assertLessEqual(sum(timeout) if isinstance(timeout,tuple) else timeout,1)
+
+    def test_worker_stage_has_no_unbounded_queue_or_unchecked_success(self):
+        self.assertTrue(hasattr(gate,'CHECK_STAGE_BUDGET_SECONDS'),'Worker stage has no budget')
+        clock=[0.0]
+        release=threading.Event()
+        submitted=threading.Event()
+        count=[]
+        class RecordingPool(ThreadPoolExecutor):
+            def submit(self,*args,**kwargs):
+                future=super().submit(*args,**kwargs)
+                count.append(future)
+                if len(count)==2:
+                    submitted.set()
+                return future
+        nodes=[node(f'vpn{i}.opengw.net') for i in range(7)]
+        def verify(n,deadline=None):
+            release.wait(2)
+            return dict(n,success=False,status='failed',error='budget exhausted',verification_passes=0)
+        outputs=[]
+        with patch.object(gate.time,'monotonic',side_effect=lambda:clock[0]), \
+             patch.object(gate,'ThreadPoolExecutor',RecordingPool), \
+             patch.object(gate,'CONCURRENCY',2), \
+             patch.object(gate,'CHECK_STAGE_BUDGET_SECONDS',5), \
+             patch.object(gate,'check_stable_node',side_effect=verify):
+            thread=threading.Thread(target=lambda:outputs.extend(gate.check_all(nodes)))
+            thread.start()
+            try:
+                self.assertTrue(submitted.wait(2))
+                self.assertEqual(len(count),2)
+                clock[0]=5.0
+            finally:
+                release.set()
+                thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(count),2)
+        self.assertEqual(len(outputs),7)
+        self.assertTrue(all(n['success'] is False for n in outputs))
+        self.assertTrue(all(n.get('verification_passes',0)<2 for n in outputs))
+
+    def test_real_blocked_worker_http_wait_uses_remaining_budget(self):
+        self.assertIn('deadline',inspect.signature(gate.check_one).parameters)
+        requested=threading.Event()
+        release=threading.Event()
+        class SlowChecker(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requested.set()
+                release.wait(2)
+                self.send_response(503)
+                self.end_headers()
+            def log_message(self,*args):
+                pass
+        server=ThreadingHTTPServer(('127.0.0.1',0),SlowChecker)
+        thread=threading.Thread(target=lambda:server.serve_forever(poll_interval=0.01),daemon=True)
+        thread.start()
+        try:
+            with gate.requests.Session() as session, \
+                 patch.object(gate,'WORKER_CHECK_URL',f'http://127.0.0.1:{server.server_port}/check?sstp='):
+                session.trust_env=False
+                started=time.monotonic()
+                result=gate.check_one(node(),session,deadline=started+0.15)
+                elapsed=time.monotonic()-started
+            self.assertTrue(requested.is_set())
+            self.assertFalse(result['success'])
+            self.assertLess(elapsed,0.75)
+        finally:
+            release.set()
+            server.shutdown()
+            server.server_close()
+            thread.join(2)
+
+    def test_disabled_budget_preserves_two_successful_checks(self):
+        self.assertTrue(hasattr(gate,'CHECK_STAGE_BUDGET_SECONDS'),'Worker stage has no budget')
+        response=Mock(status_code=200)
+        response.json.return_value={'success':True,'responseTime':100,
+            'exit':{'ip':'8.8.8.8','is_datacenter':False,'asn':{'org':'KDDI'}}}
+        session=Mock()
+        session.get.return_value=response
+        with patch.object(gate,'VERIFY_PASSES',2), \
+             patch.object(gate.requests,'Session') as factory:
+            factory.return_value.__enter__.return_value=session
+            result=gate.check_stable_node(node())
+        self.assertTrue(result['success'])
+        self.assertEqual(result['verification_passes'],2)
+        self.assertEqual(session.get.call_count,2)
+
+    def test_ample_stage_budget_preserves_original_read_timeout(self):
+        session=Mock()
+        session.get.return_value.status_code=503
+        with patch.object(gate.time,'monotonic',return_value=0), \
+             patch.object(gate,'CHECK_TIMEOUT',45):
+            gate.check_one(node(),session,deadline=900)
+        self.assertEqual(session.get.call_args.kwargs['timeout'][1],45)
+
+    def test_bounded_worker_request_cannot_follow_redirect_outside_budget(self):
+        session=Mock()
+        session.get.return_value.status_code=302
+        with patch.object(gate.time,'monotonic',return_value=0):
+            result=gate.check_one(node(),session,deadline=5)
+        self.assertFalse(result['success'])
+        self.assertIs(session.get.call_args.kwargs.get('allow_redirects'),False)
+
+    def test_completed_stable_node_survives_budget_and_unstarted_candidates_fail(self):
+        clock=[0.0]
+        nodes=[node(f'vpn{i}.opengw.net') for i in range(3)]
+        def verify(n,deadline=None):
+            clock[0]=5.0
+            return dict(n,verification_passes=2)
+        with patch.object(gate.time,'monotonic',side_effect=lambda:clock[0]), \
+             patch.object(gate,'CHECK_STAGE_BUDGET_SECONDS',5), \
+             patch.object(gate,'CONCURRENCY',1), \
+             patch.object(gate,'check_stable_node',side_effect=verify):
+            results=gate.check_all(nodes)
+        self.assertEqual(sum(n['success'] is True for n in results),1)
+        self.assertEqual(results[0]['verification_passes'],2)
+        self.assertTrue(all(n['success'] is False for n in results[1:]))
+        self.assertTrue(all(n.get('exit') is None for n in results[1:]))
+        self.assertEqual([n['host'] for n in results],[n['host'] for n in nodes])
+
+    def test_statistics_count_actual_attempts_and_report_budget_skips(self):
+        passed=dict(node('vpn100.opengw.net'),check_attempted=True)
+        partial=dict(node('vpn200.opengw.net'),check_attempted=True,success=False,verification_passes=1)
+        untouched=dict(node('vpn300.opengw.net'),check_attempted=False,success=False,verification_passes=0)
+        stats=gate.build_outputs([passed,partial,untouched],3,3,'fixture')['stats']
+        self.assertIn('candidates',stats)
+        self.assertEqual(stats['candidates'],3)
+        self.assertEqual(stats['checked'],2)
+        self.assertEqual(stats['success'],1)
+        self.assertEqual(stats['failed'],1)
+        self.assertEqual(stats['budget_skipped'],1)
+        self.assertEqual(stats['checked'],stats['success']+stats['failed'])
+
+    def test_statistics_support_legacy_results_without_attempt_flag(self):
+        stats=gate.build_outputs([node(),dict(node('vpn200.opengw.net'),success=False)],2,2,'fixture')['stats']
+        self.assertEqual(stats['checked'],2)
+        self.assertEqual(stats.get('budget_skipped'),0)
+
+    def test_unattempted_historical_success_cannot_inflate_current_statistics(self):
+        data=gate.build_outputs([dict(node(),check_attempted=False)],1,1,'fixture')
+        self.assertEqual(data['stats']['checked'],0)
+        self.assertEqual(data['stats']['success'],0)
+        self.assertEqual(data['stats']['failed'],0)
+        self.assertEqual(data['available'],[])
 
 if __name__=='__main__': unittest.main(verbosity=2)
