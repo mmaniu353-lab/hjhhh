@@ -32,7 +32,7 @@ SSTP 内层 TCP 保留最多 65,535 字节未确认数据，尊重接收窗口�
 
 需要支持当前 Mihomo 配置的客户端，本项目以 Mihomo v1.19.32 验证。导入完整 YAML，使用配置自身的 DNS，关闭“追加系统 DNS”，启用 TUN。FlClash 会用应用设置覆盖配置中的 TUN 开关，仅在 YAML 中写 `enable: true` 并不足以开启应用的 TUN。
 
-网站 DNS 通过所选住宅出口访问 Google TCP DNS，失败后不会回退到直连 DNS。DNS 随 VLESS/TLS 和 SSTP 加密到住宅出口，从出口到 Google 使用 TCP53；减少额外 DoH 握手造成的首次查询超时。Worker 收到 SSTP 目标域名或 UDP53 查询时，也通过同一个 SSTP 节点解析。
+网站 DNS 通过所选住宅出口访问 Google TCP DNS，客户端并行查询 `8.8.8.8` 和 `8.8.4.4`，失败后不会回退到直连 DNS。DNS 随 VLESS/TLS 和 SSTP 加密到住宅出口，从出口到 Google 使用 TCP53；减少额外 DoH 握手造成的首次查询超时。Worker 收到 SSTP 目标域名或 UDP53 查询时，也通过同一个 SSTP 节点解析：先查询 `8.8.4.4`，连接失败、超时、SERVFAIL、REFUSED 或截断响应时再查询 `8.8.8.8`。两次尝试各最多 6 秒，保留最多 12 秒的总预算；每次尝试都会清理隧道连接，有效 NXDOMAIN 不触发重试。这能容忍单个 DNS 地址故障，不能修复住宅节点离线或已经中断的 TLS 连接。
 
 CI 入口采用实测通过的 `172.64.155.1` 和 `172.64.144.1`，并保留自有 Worker 域名的 TLS SNI 与 Host。此次本机两条入口的 Cloudflare colo 为 SIN，自有域名的 TLS 与 trace 请求分别约 328/406 毫秒；同一组 13 个日本候选的完整链路验证中，新入口通过 8 个、旧入口通过 7 个。各自通过样本的冷连接延迟中位数约为 4.18 秒和 5.41 秒，但通过的节点集合不同，不能将这两个中位数当作同一批节点的速度提升对照。Cloudflare Anycast 路由可能变化，此数据不代表长期速度保证。`EDT_ENTRY_IPS` 可覆盖；不设置时使用自有 Worker 域名解析出的 IPv4。
 

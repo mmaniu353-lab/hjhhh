@@ -4326,7 +4326,7 @@ async function turnConnect(proxy, targetHost, targetPort, TCP连接) {
 // Destination DNS for an SSTP request must use that same VPN Gate exit.
 // The resolver address is literal, so the nested DNS socket cannot recurse.
 const SSTP_DNS_TIMEOUT_MS = 12000;
-const SSTP_DNS_RESOLVER = '8.8.4.4';
+const SSTP_DNS_RESOLVERS = ['8.8.4.4', '8.8.8.8'];
 const SSTP_DNS_CACHE = new Map();
 const SSTP_DNS_STREAMS = new WeakMap();
 
@@ -4396,6 +4396,23 @@ function parseSstpDnsA(response, query) {
 }
 
 async function exchangeSstpDns(query, proxy, TCP连接) {
+	let lastError;
+	const timeoutMs = SSTP_DNS_TIMEOUT_MS / SSTP_DNS_RESOLVERS.length;
+	for (const resolver of SSTP_DNS_RESOLVERS) {
+		try {
+			const response = await exchangeSstpDnsAtResolver(query, proxy, TCP连接, resolver, timeoutMs);
+			const flags = new DataView(response.buffer, response.byteOffset, response.byteLength).getUint16(2);
+			// A valid negative answer is authoritative; retry only transient server failures.
+			if ((flags & 0x0200) || [2, 5].includes(flags & 15)) throw new Error(`SSTP DNS resolver failed: ${flags & 15}`);
+			return response;
+		} catch (error) {
+			lastError = error;
+		}
+	}
+	throw lastError;
+}
+
+async function exchangeSstpDnsAtResolver(query, proxy, TCP连接, resolver, timeoutMs) {
 	let socket, reader, writer;
 	let finished = false;
 	const transports = new Set();
@@ -4408,7 +4425,7 @@ async function exchangeSstpDns(query, proxy, TCP连接) {
 	};
 	try {
 		return await withTimeout((async () => {
-			socket = await sstpConnect(proxy, SSTP_DNS_RESOLVER, 53, trackedConnect);
+			socket = await sstpConnect(proxy, resolver, 53, trackedConnect);
 			socket.closed?.catch?.(() => {});
 			if (finished) { closeQuietly(socket); throw new Error('SSTP DNS setup completed after deadline'); }
 			reader = socket.readable.getReader();
@@ -4432,7 +4449,7 @@ async function exchangeSstpDns(query, proxy, TCP连接) {
 				}
 				if (buffered.length > 65537) throw new Error('Oversized SSTP DNS response');
 			}
-		})(), SSTP_DNS_TIMEOUT_MS, 'SSTP DNS response timed out');
+		})(), timeoutMs, 'SSTP DNS response timed out');
 	} finally {
 		finished = true;
 		closeQuietly(socket);

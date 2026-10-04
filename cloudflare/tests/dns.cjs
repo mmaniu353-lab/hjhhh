@@ -68,6 +68,74 @@ async function test(name,fn){try{await fn();console.log('PASS',name)}catch(e){co
   await test('IPv4 target does not perform DNS',async()=>{
     const count=chainCalls.length; assert.equal(await ctx.auditResolve('1.1.1.1',proxy,()=>{}),'1.1.1.1');assert.equal(chainCalls.length,count);
   });
+  await test('primary resolver failure retries a second resolver over the same residential exit',async()=>{
+    const original=ctx.sstpConnect, calls=[], before=rawCalls.length;
+    ctx.sstpConnect=async(p,host,port)=>{
+      calls.push({p,host,port});
+      if(host==='8.8.4.4')throw Error('primary DNS unreachable');
+      return socket();
+    };
+    try{
+      const response=await ctx.exchangeSstpDns(query,proxy,()=>{throw Error('direct DNS bypass')});
+      assert.deepEqual(Buffer.from(response),dnsReply(query));
+      assert.deepEqual(calls.map(c=>c.host),['8.8.4.4','8.8.8.8']);
+      assert.ok(calls.every(c=>c.p===proxy && c.port===53));
+      assert.equal(rawCalls.length,before);
+    }finally{ctx.sstpConnect=original}
+  });
+  await test('SERVFAIL response retries the secondary resolver instead of failing domain resolution',async()=>{
+    const original=ctx.sstpConnect, calls=[];
+    ctx.sstpConnect=async(_p,host)=>{
+      calls.push(host);
+      if(host!=='8.8.4.4')return socket();
+      let controller;
+      return {close(){try{controller.close()}catch{}},closed:Promise.resolve(),
+        readable:new ReadableStream({start(c){controller=c}}),
+        writable:new WritableStream({write(buf){
+          const reply=dnsReply(Buffer.from(buf).subarray(2));reply[3]=0x82;
+          controller.enqueue(Uint8Array.from(cat([reply.length>>>8,reply.length&255],reply)));controller.close();
+        }})};
+    };
+    try{
+      assert.deepEqual(Buffer.from(await ctx.exchangeSstpDns(query,proxy,()=>{})),dnsReply(query));
+      assert.deepEqual(calls,['8.8.4.4','8.8.8.8']);
+    }finally{ctx.sstpConnect=original}
+  });
+  await test('valid NXDOMAIN is returned without an unnecessary secondary query',async()=>{
+    const original=ctx.sstpConnect, calls=[];
+    ctx.sstpConnect=async(_p,host)=>{
+      calls.push(host);let controller;
+      return {close(){try{controller.close()}catch{}},closed:Promise.resolve(),
+        readable:new ReadableStream({start(c){controller=c}}),
+        writable:new WritableStream({write(buf){
+          const reply=Buffer.from(buf).subarray(2);reply[2]=0x81;reply[3]=0x83;
+          controller.enqueue(Uint8Array.from(cat([reply.length>>>8,reply.length&255],reply)));controller.close();
+        }})};
+    };
+    try{
+      const response=await ctx.exchangeSstpDns(query,proxy,()=>{});
+      assert.equal(response[3]&15,3);assert.deepEqual(calls,['8.8.4.4']);
+    }finally{ctx.sstpConnect=original}
+  });
+  await test('primary timeout closes its transport and retries within the original total time budget',async()=>{
+    const original=ctx.sstpConnect, originalTimeout=ctx.withTimeout;
+    const calls=[],budgets=[],before=closeCount;
+    ctx.sstpConnect=async(_p,host,_port,connector)=>{
+      calls.push(host);
+      if(host==='8.8.4.4'){connector({hostname:host,port:53});return new Promise(()=>{})}
+      return socket();
+    };
+    ctx.withTimeout=(p,ms,message)=>new Promise((resolve,reject)=>{
+      budgets.push(ms);const timer=setTimeout(()=>reject(Error(message)),10);
+      Promise.resolve(p).then(v=>{clearTimeout(timer);resolve(v)},e=>{clearTimeout(timer);reject(e)});
+    });
+    try{
+      assert.deepEqual(Buffer.from(await ctx.exchangeSstpDns(query,proxy,ctx['创建请求TCP连接器']())),dnsReply(query));
+      assert.deepEqual(calls,['8.8.4.4','8.8.8.8']);
+      assert.ok(budgets.every(b=>b>0));assert.ok(budgets.reduce((a,b)=>a+b,0)<=12000);
+      assert.ok(closeCount>=before+2);
+    }finally{ctx.sstpConnect=original;ctx.withTimeout=originalTimeout}
+  });
   await test('DNS failure is propagated without direct fallback',async()=>{
     failChain=true; const before=rawCalls.length;
     await assert.rejects(ctx.forwardataudp(framed,{readyState:1},null,{},null,route));
